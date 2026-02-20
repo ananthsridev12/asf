@@ -31,8 +31,51 @@ final class RelationshipEngine
             return $blood;
         }
 
-        // In-law via spouse relation.
+        $baseGender = (string)($base['gender'] ?? 'unknown');
+        $otherGender = (string)($other['gender'] ?? 'unknown');
+
+        // Spouse of sibling / sibling's child
+        $siblingIds = $this->getSiblingIds($baseId);
+        if (!empty($siblingIds)) {
+            if ($this->isMarriedToAny($otherId, $siblingIds)) {
+                $label = $this->siblingSpouseLabel($otherGender);
+                return $this->result($label, 'in_law', 'in_law', 2, 0, null, 0, 0);
+            }
+            if ($this->isChildOfAny($otherId, $siblingIds)) {
+                $label = $otherGender === 'male' ? 'Nephew' : ($otherGender === 'female' ? 'Niece' : 'Niece/Nephew');
+                return $this->result($label, 'extended', 'both', 2, 1, null, 0, 0);
+            }
+        }
+
+        // Spouse sibling families (co-sister/co-brother and their children).
         $spouseIds = $this->getSpouseIds($baseId);
+        $spouseSiblingIds = [];
+        foreach ($spouseIds as $spouseId) {
+            foreach ($this->getSiblingIds($spouseId) as $sid) {
+                if ($sid !== $baseId && !in_array($sid, $spouseIds, true)) {
+                    $spouseSiblingIds[] = $sid;
+                }
+            }
+        }
+        $spouseSiblingIds = array_values(array_unique($spouseSiblingIds));
+        if (!empty($spouseSiblingIds)) {
+            if ($this->isMarriedToAny($otherId, $spouseSiblingIds)) {
+                if ($baseGender === 'female' && $otherGender === 'female') {
+                    return $this->result('Co-sister', 'in_law', 'in_law', 2, 0, null, 0, 0);
+                }
+                if ($baseGender === 'male' && $otherGender === 'male') {
+                    return $this->result('Co-brother', 'in_law', 'in_law', 2, 0, null, 0, 0);
+                }
+                $label = $otherGender === 'male' ? 'Brother-in-law' : ($otherGender === 'female' ? 'Sister-in-law' : 'Sibling-in-law');
+                return $this->result($label, 'in_law', 'in_law', 2, 0, null, 0, 0);
+            }
+            if ($this->isChildOfAny($otherId, $spouseSiblingIds)) {
+                $label = $otherGender === 'male' ? 'Nephew-in-law' : ($otherGender === 'female' ? 'Niece-in-law' : 'Niece/Nephew-in-law');
+                return $this->result($label, 'in_law', 'in_law', 3, 1, null, 0, 0);
+            }
+        }
+
+        // In-law via spouse relation.
         foreach ($spouseIds as $spouseId) {
             $spouse = $this->persons->getById($spouseId);
             if (!$spouse) {
@@ -211,6 +254,53 @@ final class RelationshipEngine
         return array_values(array_unique(array_map(static fn($r) => (int)$r['spouse_id'], $rows)));
     }
 
+    private function getSiblingIds(int $personId): array
+    {
+        $stmt = $this->db->prepare(
+            'SELECT DISTINCT b.child_id
+             FROM parent_child a
+             INNER JOIN parent_child b ON a.parent_id = b.parent_id
+             WHERE a.child_id = :id AND b.child_id != :id2'
+        );
+        $stmt->execute([':id' => $personId, ':id2' => $personId]);
+        $rows = $stmt->fetchAll();
+        return array_values(array_unique(array_map(static fn($r) => (int)$r['child_id'], $rows)));
+    }
+
+    private function isMarriedToAny(int $personId, array $candidateIds): bool
+    {
+        if (empty($candidateIds)) {
+            return false;
+        }
+        $placeholders = implode(',', array_fill(0, count($candidateIds), '?'));
+        $stmt = $this->db->prepare(
+            "SELECT 1
+             FROM marriages
+             WHERE ((person1_id = ? AND person2_id IN ($placeholders))
+                 OR (person2_id = ? AND person1_id IN ($placeholders)))
+             LIMIT 1"
+        );
+        $params = array_merge([$personId], $candidateIds, [$personId], $candidateIds);
+        $stmt->execute($params);
+        return (bool)$stmt->fetch();
+    }
+
+    private function isChildOfAny(int $childId, array $parentIds): bool
+    {
+        if (empty($parentIds)) {
+            return false;
+        }
+        $placeholders = implode(',', array_fill(0, count($parentIds), '?'));
+        $stmt = $this->db->prepare(
+            "SELECT 1
+             FROM parent_child
+             WHERE child_id = ? AND parent_id IN ($placeholders)
+             LIMIT 1"
+        );
+        $stmt->execute(array_merge([$childId], $parentIds));
+        return (bool)$stmt->fetch();
+    }
+
     private function result(
         string $label,
         string $category,
@@ -350,6 +440,17 @@ final class RelationshipEngine
             return str_contains($bloodLabel, 'Niece') ? 'Niece-in-law' : 'Nephew-in-law';
         }
         return 'In-law';
+    }
+
+    private function siblingSpouseLabel(string $gender): string
+    {
+        if ($gender === 'male') {
+            return 'Brother-in-law';
+        }
+        if ($gender === 'female') {
+            return 'Sister-in-law';
+        }
+        return 'Sibling-in-law';
     }
 
     private function nextSide(string $currentSide, string $parentType, int $currentDistance): string
