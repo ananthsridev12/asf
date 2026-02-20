@@ -1,0 +1,5 @@
+---
+deployment:
+  tasks:
+    - export DEPLOYPATH=/home1/de2shrnx/as.easi7.in
+    - /bin/cp -R * $DEPLOYPATH

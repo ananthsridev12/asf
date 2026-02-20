@@ -255,6 +255,30 @@ final class MemberController
         include __DIR__ . '/../views/member/person_add.php';
     }
 
+    public function showEditFamilyMember(): void
+    {
+        $id = (int)($_GET['id'] ?? 0);
+        [$basePerson, $person] = $this->assertMemberCanManagePerson($id);
+
+        $error = $_SESSION['flash_error'] ?? null;
+        $success = $_SESSION['flash_success'] ?? null;
+        unset($_SESSION['flash_error'], $_SESSION['flash_success']);
+
+        $branches = $this->branches->all();
+
+        $parentsStmt = $this->db->prepare(
+            'SELECT pc.parent_id, pc.parent_type, pc.birth_order, p.full_name
+             FROM parent_child pc
+             INNER JOIN persons p ON p.person_id = pc.parent_id
+             WHERE pc.child_id = :id
+             ORDER BY pc.parent_type'
+        );
+        $parentsStmt->execute([':id' => $id]);
+        $parentRows = $parentsStmt->fetchAll();
+
+        include __DIR__ . '/../views/member/person_edit.php';
+    }
+
     public function createFamilyMember(): void
     {
         $token = $_POST['csrf_token'] ?? '';
@@ -275,6 +299,8 @@ final class MemberController
 
         $existingPersonId = (int)($_POST['existing_person_id'] ?? 0);
         $referencePersonId = (int)($_POST['reference_person_id'] ?? 0);
+        $parentPersonId = (int)($_POST['parent_person_id'] ?? 0);
+        $parentLinkType = (string)($_POST['parent_link_type'] ?? 'father');
         $fullName = trim($_POST['full_name'] ?? '');
         $gender = $_POST['gender'] ?? 'unknown';
         $dateOfBirth = trim($_POST['date_of_birth'] ?? '');
@@ -299,6 +325,11 @@ final class MemberController
         $allowedParentTypes = ['father','mother','adoptive','step'];
         if ($relationType === 'child' && !in_array($parentType, $allowedParentTypes, true)) {
             $_SESSION['flash_error'] = 'Select valid parent type for child relation.';
+            header('Location: /index.php?route=member-person-add');
+            exit;
+        }
+        if ($parentPersonId > 0 && !in_array($parentLinkType, $allowedParentTypes, true)) {
+            $_SESSION['flash_error'] = 'Invalid parent link type.';
             header('Location: /index.php?route=member-person-add');
             exit;
         }
@@ -382,6 +413,21 @@ final class MemberController
                 $bo
             );
 
+            if ($parentPersonId > 0) {
+                if ($parentPersonId === $targetPersonId) {
+                    throw new RuntimeException('Parent and child cannot be the same person.');
+                }
+                $parentPerson = $this->persons->getById($parentPersonId);
+                if (!$parentPerson) {
+                    throw new RuntimeException('Selected parent not found.');
+                }
+                if ((int)$parentPerson['branch_id'] !== (int)$basePerson['branch_id']) {
+                    throw new RuntimeException('Selected parent must be in your family line.');
+                }
+                $this->upsertParentChild($parentPersonId, $targetPersonId, $parentLinkType, null);
+                $this->rebuildSubtreeForChild($targetPersonId, $parentPersonId);
+            }
+
             if ($userId > 0) {
                 $this->logs->log($userId, 'member_added_family_person', $targetPersonId);
             }
@@ -398,6 +444,138 @@ final class MemberController
             header('Location: /index.php?route=member-person-add');
             exit;
         }
+    }
+
+    public function updateFamilyMember(): void
+    {
+        $id = (int)($_POST['person_id'] ?? 0);
+        $token = $_POST['csrf_token'] ?? '';
+        if (!verify_csrf($token)) {
+            $_SESSION['flash_error'] = 'Invalid CSRF token.';
+            header('Location: /index.php?route=member-person-edit&id=' . $id);
+            exit;
+        }
+
+        [, $person] = $this->assertMemberCanManagePerson($id);
+
+        $fullName = trim($_POST['full_name'] ?? '');
+        $gender = $_POST['gender'] ?? 'unknown';
+        $dateOfBirth = trim($_POST['date_of_birth'] ?? '');
+        $birthYear = trim($_POST['birth_year'] ?? '');
+        $dateOfDeath = trim($_POST['date_of_death'] ?? '');
+        $bloodGroup = trim($_POST['blood_group'] ?? '');
+        $occupation = trim($_POST['occupation'] ?? '');
+        $mobile = trim($_POST['mobile'] ?? '');
+        $email = trim($_POST['email'] ?? '');
+        $address = trim($_POST['address'] ?? '');
+        $currentLocation = trim($_POST['current_location'] ?? '');
+        $nativeLocation = trim($_POST['native_location'] ?? '');
+        $isAlive = isset($_POST['is_alive']) ? 1 : 0;
+
+        if ($fullName === '') {
+            $_SESSION['flash_error'] = 'Full name is required.';
+            header('Location: /index.php?route=member-person-edit&id=' . $id);
+            exit;
+        }
+
+        $allowedGenders = ['male','female','other','unknown'];
+        if (!in_array($gender, $allowedGenders, true)) {
+            $gender = 'unknown';
+        }
+
+        $dob = $dateOfBirth !== '' ? $dateOfBirth : null;
+        $by = $birthYear !== '' ? (int)$birthYear : null;
+        $dod = $dateOfDeath !== '' ? $dateOfDeath : null;
+
+        $stmt = $this->db->prepare(
+            'UPDATE persons SET
+                full_name = :full_name,
+                gender = :gender,
+                date_of_birth = :date_of_birth,
+                birth_year = :birth_year,
+                date_of_death = :date_of_death,
+                blood_group = :blood_group,
+                occupation = :occupation,
+                mobile = :mobile,
+                email = :email,
+                address = :address,
+                current_location = :current_location,
+                native_location = :native_location,
+                is_alive = :is_alive
+             WHERE person_id = :id'
+        );
+        $stmt->execute([
+            ':full_name' => $fullName,
+            ':gender' => $gender,
+            ':date_of_birth' => $dob,
+            ':birth_year' => $by,
+            ':date_of_death' => $dod,
+            ':blood_group' => $bloodGroup !== '' ? $bloodGroup : null,
+            ':occupation' => $occupation !== '' ? $occupation : null,
+            ':mobile' => $mobile !== '' ? $mobile : null,
+            ':email' => $email !== '' ? $email : null,
+            ':address' => $address !== '' ? $address : null,
+            ':current_location' => $currentLocation !== '' ? $currentLocation : null,
+            ':native_location' => $nativeLocation !== '' ? $nativeLocation : null,
+            ':is_alive' => $isAlive,
+            ':id' => $id,
+        ]);
+
+        if (!empty($_SESSION['user']['user_id'])) {
+            $this->logs->log((int)$_SESSION['user']['user_id'], 'member_family_person_updated', $id);
+        }
+
+        $_SESSION['flash_success'] = 'Person updated.';
+        header('Location: /index.php?route=member-person-edit&id=' . $id);
+        exit;
+    }
+
+    public function addParentFromEdit(): void
+    {
+        $childId = (int)($_POST['child_id'] ?? 0);
+        $token = $_POST['csrf_token'] ?? '';
+        if (!verify_csrf($token)) {
+            $_SESSION['flash_error'] = 'Invalid CSRF token.';
+            header('Location: /index.php?route=member-person-edit&id=' . $childId);
+            exit;
+        }
+
+        [$basePerson, $person] = $this->assertMemberCanManagePerson($childId);
+
+        $parentId = (int)($_POST['parent_id'] ?? 0);
+        $parentType = (string)($_POST['parent_type'] ?? '');
+        $birthOrder = trim($_POST['birth_order'] ?? '');
+        $bo = $birthOrder !== '' ? (int)$birthOrder : null;
+
+        $allowedParentTypes = ['father','mother','adoptive','step'];
+        if ($parentId <= 0 || !in_array($parentType, $allowedParentTypes, true)) {
+            $_SESSION['flash_error'] = 'Invalid parent data.';
+            header('Location: /index.php?route=member-person-edit&id=' . $childId);
+            exit;
+        }
+        if ($parentId === $childId) {
+            $_SESSION['flash_error'] = 'Parent and child cannot be same person.';
+            header('Location: /index.php?route=member-person-edit&id=' . $childId);
+            exit;
+        }
+
+        $parent = $this->persons->getById($parentId);
+        if (!$parent || (int)$parent['branch_id'] !== (int)$basePerson['branch_id']) {
+            $_SESSION['flash_error'] = 'Selected parent must be in your family line.';
+            header('Location: /index.php?route=member-person-edit&id=' . $childId);
+            exit;
+        }
+
+        $this->upsertParentChild($parentId, $childId, $parentType, $bo);
+        $this->rebuildSubtreeForChild($childId, $parentId);
+
+        if (!empty($_SESSION['user']['user_id'])) {
+            $this->logs->log((int)$_SESSION['user']['user_id'], 'member_parent_assigned', $childId);
+        }
+
+        $_SESSION['flash_success'] = 'Parent assigned.';
+        header('Location: /index.php?route=member-person-edit&id=' . $childId);
+        exit;
     }
 
     public function showAddMarriage(): void
@@ -791,6 +969,32 @@ final class MemberController
         header('Content-Type: application/json; charset=utf-8');
         echo json_encode($rows);
         exit;
+    }
+
+    private function assertMemberCanManagePerson(int $personId): array
+    {
+        $basePersonId = (int)($_SESSION['user']['person_id'] ?? 0);
+        $basePerson = $basePersonId > 0 ? $this->persons->getById($basePersonId) : null;
+        if (!$basePerson) {
+            http_response_code(403);
+            echo 'Complete your profile first.';
+            exit;
+        }
+
+        $person = $this->persons->getById($personId);
+        if (!$person) {
+            http_response_code(404);
+            echo 'Person not found';
+            exit;
+        }
+
+        if ((int)$person['branch_id'] !== (int)$basePerson['branch_id']) {
+            http_response_code(403);
+            echo '403 - Forbidden';
+            exit;
+        }
+
+        return [$basePerson, $person];
     }
 
     private function createMemberOwnedPerson(

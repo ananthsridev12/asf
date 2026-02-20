@@ -36,6 +36,7 @@ require_role('member');
               <th>Age</th>
               <th>Family Line</th>
               <th>Relationship</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody>
@@ -48,6 +49,9 @@ require_role('member');
                 <td><?php echo htmlspecialchars((string)($p['age_display'] ?? ''), ENT_QUOTES, 'UTF-8'); ?></td>
                 <td><?php echo htmlspecialchars((string)($p['branch_label'] ?? ('Line #' . (int)$p['branch_id'])), ENT_QUOTES, 'UTF-8'); ?></td>
                 <td><?php echo htmlspecialchars((string)($relations[(int)$p['person_id']] ?? ''), ENT_QUOTES, 'UTF-8'); ?></td>
+                <td>
+                  <a class="btn btn-sm btn-outline-primary" href="/index.php?route=member-person-edit&id=<?php echo (int)$p['person_id']; ?>">Edit</a>
+                </td>
               </tr>
             <?php endforeach; ?>
           </tbody>

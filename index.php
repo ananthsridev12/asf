@@ -193,6 +193,22 @@ switch ($route) {
         }
         break;
 
+    case 'member-person-edit':
+        require_role('member');
+        if ($method === 'POST') {
+            $memberController->updateFamilyMember();
+        } else {
+            $memberController->showEditFamilyMember();
+        }
+        break;
+
+    case 'member-parent-add':
+        require_role('member');
+        if ($method === 'POST') {
+            $memberController->addParentFromEdit();
+        }
+        break;
+
     case 'member-marriage-add':
         require_role('member');
         if ($method === 'POST') {

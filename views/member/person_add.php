@@ -60,6 +60,21 @@ require_role('member');
           <label class="form-label">Or New Full Name</label>
           <input type="text" name="full_name" id="full_name" class="form-control">
         </div>
+        <div class="col-md-6 position-relative">
+          <label class="form-label">Parent (optional)</label>
+          <input type="text" id="parent_search" class="form-control" placeholder="Search parent name or ID">
+          <input type="hidden" name="parent_person_id" id="parent_person_id">
+          <div id="parent_results" class="list-group position-absolute w-100" style="z-index: 1000;"></div>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label">Parent Type (if selected)</label>
+          <select name="parent_link_type" class="form-select">
+            <option value="father">Father</option>
+            <option value="mother">Mother</option>
+            <option value="adoptive">Adoptive</option>
+            <option value="step">Step</option>
+          </select>
+        </div>
         <div class="col-md-3">
           <label class="form-label">Gender</label>
           <select name="gender" class="form-select">
@@ -201,6 +216,7 @@ require_role('member');
       attachSearch('existing_search', 'existing_person_id', 'existing_results', function () {
         fullName.value = '';
       });
+      attachSearch('parent_search', 'parent_person_id', 'parent_results');
 
       fullName.addEventListener('input', function () {
         if (fullName.value.trim() !== '') {
