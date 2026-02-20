@@ -4,568 +4,427 @@ declare(strict_types=1);
 final class RelationshipEngine
 {
     private PDO $db;
-    private PersonModel $persons;
-    private ?array $dictionary = null;
+    private array $people = [];
+    private array $ancestorCache = [];
+    private array $columns = [];
 
-    public function __construct(PDO $db, PersonModel $persons)
+    public function __construct(PDO $db)
     {
         $this->db = $db;
-        $this->persons = $persons;
     }
 
-    public function calculate(array $base, array $other): array
+    public function getRelationship(int $personAId, int $personBId): array
     {
-        $baseId = (int)$base['person_id'];
-        $otherId = (int)$other['person_id'];
-
-        if ($baseId === $otherId) {
-            return $this->result('self', 'Self', 'core', 'both', 0, 0, null, 0, 0);
+        $this->loadPeople();
+        $a = $this->people[$personAId] ?? null;
+        $b = $this->people[$personBId] ?? null;
+        if (!$a || !$b) {
+            return $this->result('No relationship', null, null, 0, 'Direct', null, null);
         }
 
-        if ($this->hasMarriage($baseId, $otherId)) {
-            $label = ((string)($other['gender'] ?? '') === 'male') ? 'Husband' : (((string)($other['gender'] ?? '') === 'female') ? 'Wife' : 'Spouse');
-            $relKey = strtolower($label);
-            return $this->result($relKey, $label, 'core', 'in_law', 1, 0, null, 0, 0);
+        if ($personAId === $personBId) {
+            return $this->result('Self', 0, 0, 0, 'Direct', null, null);
         }
 
-        $blood = $this->calculateBlood($base, $other, 6);
-        if ($blood !== null) {
-            return $blood;
+        $direct = $this->resolveDirect($a, $b);
+        if ($direct !== null) {
+            return $direct;
         }
 
-        $baseGender = (string)($base['gender'] ?? 'unknown');
-        $otherGender = (string)($other['gender'] ?? 'unknown');
-
-        // Spouse of sibling / sibling's child
-        $siblingIds = $this->getSiblingIds($baseId);
-        if (!empty($siblingIds)) {
-            if ($this->isMarriedToAny($otherId, $siblingIds)) {
-                $label = $this->siblingSpouseLabel($otherGender);
-                return $this->result($this->toKey($label), $label, 'in_law', 'in_law', 2, 0, null, 0, 0);
-            }
-            if ($this->isChildOfAny($otherId, $siblingIds)) {
-                $label = $otherGender === 'male' ? 'Nephew' : ($otherGender === 'female' ? 'Niece' : 'Niece/Nephew');
-                return $this->result($this->toKey($label), $label, 'extended', 'both', 2, 1, null, 0, 0);
-            }
+        $inLaw = $this->resolveInLaw($a, $b);
+        if ($inLaw !== null) {
+            return $inLaw;
         }
 
-        // Spouse sibling families (co-sister/co-brother and their children).
-        $spouseIds = $this->getSpouseIds($baseId);
-        $spouseSiblingIds = [];
-        foreach ($spouseIds as $spouseId) {
-            foreach ($this->getSiblingIds($spouseId) as $sid) {
-                if ($sid !== $baseId && !in_array($sid, $spouseIds, true)) {
-                    $spouseSiblingIds[] = $sid;
-                }
-            }
-        }
-        $spouseSiblingIds = array_values(array_unique($spouseSiblingIds));
-        if (!empty($spouseSiblingIds)) {
-            if ($this->isMarriedToAny($otherId, $spouseSiblingIds)) {
-                if ($baseGender === 'female' && $otherGender === 'female') {
-                    return $this->result('co_sister', 'Co-sister', 'in_law', 'in_law', 2, 0, null, 0, 0);
-                }
-                if ($baseGender === 'male' && $otherGender === 'male') {
-                    return $this->result('co_brother', 'Co-brother', 'in_law', 'in_law', 2, 0, null, 0, 0);
-                }
-                $label = $otherGender === 'male' ? 'Brother-in-law' : ($otherGender === 'female' ? 'Sister-in-law' : 'Sibling-in-law');
-                return $this->result($this->toKey($label), $label, 'in_law', 'in_law', 2, 0, null, 0, 0);
-            }
-            if ($this->isChildOfAny($otherId, $spouseSiblingIds)) {
-                $label = $otherGender === 'male' ? 'Nephew-in-law' : ($otherGender === 'female' ? 'Niece-in-law' : 'Niece/Nephew-in-law');
-                return $this->result($this->toKey($label), $label, 'in_law', 'in_law', 3, 1, null, 0, 0);
-            }
+        $lca = $this->findLca((int)$a['person_id'], (int)$b['person_id']);
+        if ($lca === null) {
+            return $this->result('No relationship', null, null, 0, 'Direct', null, null);
         }
 
-        // In-law via spouse relation.
-        foreach ($spouseIds as $spouseId) {
-            $spouse = $this->persons->getById($spouseId);
-            if (!$spouse) {
-                continue;
-            }
-            $spouseBlood = $this->calculateBlood($spouse, $other, 6);
-            if ($spouseBlood === null) {
-                continue;
-            }
-            $label = $this->toInLawLabel((string)$spouseBlood['label'], (string)($other['gender'] ?? 'unknown'));
+        $x = (int)$lca['depth_a'];
+        $y = (int)$lca['depth_b'];
+        $generationDifference = $y - $x;
+        $side = $this->sideFromEdge((string)$lca['edge_a']);
+        $lcaId = (int)$lca['id'];
+        $lcaName = (string)($this->people[$lcaId]['full_name'] ?? '');
+
+        if ($y === 0 && $x > 0) {
             return $this->result(
-                $this->toKey($label),
-                $label,
-                'in_law',
-                'in_law',
-                (int)$spouseBlood['degree'],
-                (int)$spouseBlood['generation_delta'],
-                $spouseBlood['lca_person_id'] ?? null,
-                (int)($spouseBlood['steps_from_person1'] ?? 0),
-                (int)($spouseBlood['steps_from_person2'] ?? 0)
+                $this->ancestorTitle($x, (string)$b['gender'], $side),
+                1,
+                null,
+                $generationDifference,
+                $side,
+                $lcaId,
+                $lcaName
             );
         }
+        if ($x === 0 && $y > 0) {
+            return $this->result(
+                $this->descendantTitle($y, (string)$b['gender']),
+                1,
+                null,
+                $generationDifference,
+                $side
+            );
+        }
+        if ($x === 1 && $y === 1) {
+            return $this->result($this->gendered((string)$b['gender'], 'Brother', 'Sister', 'Sibling'), 1, null, 0, $side, $lcaId, $lcaName);
+        }
+        if ($x === 1 && $y === 2) {
+            return $this->result($this->gendered((string)$b['gender'], 'Uncle', 'Aunt', 'Uncle/Aunt'), 2, null, 1, $side, $lcaId, $lcaName);
+        }
+        if ($x === 2 && $y === 1) {
+            return $this->result($this->gendered((string)$b['gender'], 'Nephew', 'Niece', 'Nephew/Niece'), 2, null, -1, $side, $lcaId, $lcaName);
+        }
 
-        return $this->result('no_direct_relationship', 'No direct relationship', 'extended', 'both', 0, 0, null, 0, 0);
+        $cousinLevel = min($x, $y) - 1;
+        $removed = abs($x - $y);
+        if ($cousinLevel >= 1) {
+            $title = $this->ordinal($cousinLevel) . ' Cousin';
+            if ($removed > 0) {
+                $title .= ' ' . $this->removedText($removed);
+            }
+            return $this->result($title, max(1, $cousinLevel), $removed, $generationDifference, $side, $lcaId, $lcaName);
+        }
+
+        return $this->result('Relative', null, null, $generationDifference, $side, $lcaId, $lcaName);
     }
 
-    private function calculateBlood(array $base, array $other, int $maxDepth): ?array
+    public function getRelationshipMapForRoot(int $rootId, array $personIds): array
     {
-        $baseId = (int)$base['person_id'];
-        $otherId = (int)$other['person_id'];
-        $otherGender = (string)($other['gender'] ?? 'unknown');
+        $out = [];
+        foreach ($personIds as $pid) {
+            $r = $this->getRelationship($rootId, (int)$pid);
+            $out[(int)$pid] = [
+                'id' => (int)$pid,
+                'name' => (string)($this->people[(int)$pid]['full_name'] ?? ''),
+                'relationship' => $r['title'],
+                'generation_distance' => $r['generation_difference'],
+                'cousin_level' => $r['cousin_level'],
+                'removed' => $r['removed'],
+                'side' => $r['side'],
+            ];
+        }
+        return $out;
+    }
 
-        $baseMap = $this->buildAncestorMap($baseId, $maxDepth);
-        $otherMap = $this->buildAncestorMap($otherId, $maxDepth);
+    private function resolveDirect(array $a, array $b): ?array
+    {
+        $aid = (int)$a['person_id'];
+        $bid = (int)$b['person_id'];
 
-        if (isset($baseMap[$otherId]) && (int)$baseMap[$otherId]['distance'] > 0) {
-            $distance = (int)$baseMap[$otherId]['distance'];
-            $side = (string)$baseMap[$otherId]['side'];
-            $label = $this->ancestorDescendantLabel($distance, $otherGender, true, $side);
-            return $this->result($this->ancestorDescendantKey($distance, $otherGender, true, $side), $label, 'ancestor', $side, $distance, -$distance, $otherId, $distance, 0);
+        if ((int)$a['father_id'] === $bid) {
+            return $this->result('Father', 1, null, -1, 'Paternal');
+        }
+        if ((int)$a['mother_id'] === $bid) {
+            return $this->result('Mother', 1, null, -1, 'Maternal');
+        }
+        if ((int)$b['father_id'] === $aid || (int)$b['mother_id'] === $aid) {
+            return $this->result($this->gendered((string)$b['gender'], 'Son', 'Daughter', 'Child'), 1, null, 1, 'Direct');
+        }
+        if ($this->areMutualSpouses($aid, $bid)) {
+            return $this->result($this->gendered((string)$b['gender'], 'Husband', 'Wife', 'Spouse'), 1, null, 0, 'Direct');
+        }
+        if ($this->areSiblings($aid, $bid)) {
+            return $this->result($this->gendered((string)$b['gender'], 'Brother', 'Sister', 'Sibling'), 1, null, 0, 'Direct');
+        }
+        return null;
+    }
+
+    private function resolveInLaw(array $a, array $b): ?array
+    {
+        $aid = (int)$a['person_id'];
+        $bid = (int)$b['person_id'];
+        $spouseId = (int)$a['spouse_id'];
+        if ($spouseId > 0 && $this->areMutualSpouses($aid, $spouseId)) {
+            $spouse = $this->people[$spouseId] ?? null;
+            if ($spouse) {
+                if ((int)$spouse['father_id'] === $bid) {
+                    return $this->result('Father-in-law', 1, null, -1, 'In-Law');
+                }
+                if ((int)$spouse['mother_id'] === $bid) {
+                    return $this->result('Mother-in-law', 1, null, -1, 'In-Law');
+                }
+                if ($this->areSiblings($spouseId, $bid)) {
+                    return $this->result($this->gendered((string)$b['gender'], 'Brother-in-law', 'Sister-in-law', 'Sibling-in-law'), 2, null, 0, 'In-Law');
+                }
+            }
         }
 
-        if (isset($otherMap[$baseId]) && (int)$otherMap[$baseId]['distance'] > 0) {
-            $distance = (int)$otherMap[$baseId]['distance'];
-            $side = (string)$otherMap[$baseId]['side'];
-            $label = $this->ancestorDescendantLabel($distance, $otherGender, false, $side);
-            return $this->result($this->ancestorDescendantKey($distance, $otherGender, false, $side), $label, 'descendant', $side, $distance, $distance, $baseId, 0, $distance);
+        if ($this->areSiblings($aid, $bid)) {
+            return null;
         }
 
-        $common = array_values(array_intersect(array_keys($baseMap), array_keys($otherMap)));
+        $bSpouseId = (int)$b['spouse_id'];
+        if ($bSpouseId > 0 && $this->areMutualSpouses($bid, $bSpouseId)) {
+            if ($this->areSiblings($aid, $bSpouseId)) {
+                return $this->result($this->gendered((string)$b['gender'], 'Brother-in-law', 'Sister-in-law', 'Sibling-in-law'), 2, null, 0, 'In-Law');
+            }
+            if ((int)$a['father_id'] === $bSpouseId || (int)$a['mother_id'] === $bSpouseId) {
+                return $this->result($this->gendered((string)$b['gender'], 'Son-in-law', 'Daughter-in-law', 'Child-in-law'), 2, null, 1, 'In-Law');
+            }
+        }
+
+        return null;
+    }
+
+    private function findLca(int $aId, int $bId): ?array
+    {
+        $aAnc = $this->ancestorMap($aId);
+        $bAnc = $this->ancestorMap($bId);
+        $common = array_intersect(array_keys($aAnc), array_keys($bAnc));
         if (empty($common)) {
             return null;
         }
 
-        $bestLca = null;
-        $bestSum = PHP_INT_MAX;
-        $bestMax = PHP_INT_MAX;
-        foreach ($common as $ancestorId) {
-            $d1 = (int)$baseMap[$ancestorId]['distance'];
-            $d2 = (int)$otherMap[$ancestorId]['distance'];
-            if ($d1 === 0 && $d2 === 0) {
-                continue;
-            }
-            $sum = $d1 + $d2;
-            $max = max($d1, $d2);
-            if ($sum < $bestSum || ($sum === $bestSum && $max < $bestMax)) {
-                $bestLca = (int)$ancestorId;
-                $bestSum = $sum;
-                $bestMax = $max;
+        $best = null;
+        foreach ($common as $id) {
+            $x = (int)$aAnc[$id]['depth'];
+            $y = (int)$bAnc[$id]['depth'];
+            $score = $x + $y;
+            if ($best === null || $score < $best['score'] || ($score === $best['score'] && max($x, $y) < max($best['depth_a'], $best['depth_b']))) {
+                $best = [
+                    'id' => (int)$id,
+                    'depth_a' => $x,
+                    'depth_b' => $y,
+                    'edge_a' => (string)$aAnc[$id]['first_edge'],
+                    'score' => $score,
+                ];
             }
         }
-
-        if ($bestLca === null) {
-            return null;
-        }
-
-        $d1 = (int)$baseMap[$bestLca]['distance'];
-        $d2 = (int)$otherMap[$bestLca]['distance'];
-        $side = $this->mergeSide((string)$baseMap[$bestLca]['side'], (string)$otherMap[$bestLca]['side']);
-
-        if ($d1 === 1 && $d2 === 1) {
-            $label = $this->siblingLabel($base, $other);
-            return $this->result($this->toKey($label), $label, 'core', $side, 1, 0, $bestLca, $d1, $d2);
-        }
-
-        if ($d1 === 1 && $d2 >= 2) {
-            $label = $this->nephewNieceLabel($d2, $otherGender, $side);
-            return $this->result($this->toKey($label), $label, 'extended', $side, $d2 - 1, 1 - $d2, $bestLca, $d1, $d2);
-        }
-
-        if ($d2 === 1 && $d1 >= 2) {
-            $label = $this->uncleAuntLabel($d1, $otherGender, $side);
-            return $this->result($this->toKey($label), $label, 'extended', $side, $d1 - 1, $d1 - 1, $bestLca, $d1, $d2);
-        }
-
-        $minD = min($d1, $d2);
-        if ($minD >= 2) {
-            $degree = $minD - 1;
-            $removed = abs($d1 - $d2);
-            $label = ucfirst($this->ordinal($degree) . ' cousin');
-            if ($removed > 0) {
-                $label .= ' ' . $this->removedText($removed);
-            }
-            return $this->result($this->cousinKey($degree, $removed), $label, 'cousin', $side, $degree, $d1 - $d2, $bestLca, $d1, $d2);
-        }
-
-        return null;
+        return $best;
     }
 
-    private function buildAncestorMap(int $personId, int $maxDepth): array
+    private function ancestorMap(int $personId): array
     {
-        $map = [
-            $personId => ['distance' => 0, 'side' => 'both'],
+        if (isset($this->ancestorCache[$personId])) {
+            return $this->ancestorCache[$personId];
+        }
+        $out = [
+            $personId => ['depth' => 0, 'first_edge' => 'direct'],
         ];
-        $queue = [
-            ['id' => $personId, 'distance' => 0, 'side' => 'both'],
-        ];
-        $stmt = $this->db->prepare('SELECT parent_id, parent_type FROM parent_child WHERE child_id = :id');
-
+        $queue = [[$personId, 0, 'direct']];
         while (!empty($queue)) {
-            $node = array_shift($queue);
-            $id = (int)$node['id'];
-            $distance = (int)$node['distance'];
-            $side = (string)$node['side'];
-            if ($distance >= $maxDepth) {
+            [$id, $depth, $firstEdge] = array_shift($queue);
+            if ($depth >= 6) {
                 continue;
             }
-
-            $stmt->execute([':id' => $id]);
-            $rows = $stmt->fetchAll();
-            foreach ($rows as $row) {
-                $parentId = (int)$row['parent_id'];
-                $parentType = (string)$row['parent_type'];
-                $nextDistance = $distance + 1;
-                $nextSide = $this->nextSide($side, $parentType, $distance);
-
-                if (!isset($map[$parentId])) {
-                    $map[$parentId] = ['distance' => $nextDistance, 'side' => $nextSide];
-                    $queue[] = ['id' => $parentId, 'distance' => $nextDistance, 'side' => $nextSide];
+            $p = $this->people[$id] ?? null;
+            if (!$p) {
+                continue;
+            }
+            $parents = [
+                ['id' => (int)$p['father_id'], 'edge' => 'father'],
+                ['id' => (int)$p['mother_id'], 'edge' => 'mother'],
+            ];
+            foreach ($parents as $entry) {
+                $pid = (int)$entry['id'];
+                if ($pid <= 0 || $pid === $id) {
                     continue;
                 }
-
-                $existingDistance = (int)$map[$parentId]['distance'];
-                if ($nextDistance < $existingDistance) {
-                    $map[$parentId] = ['distance' => $nextDistance, 'side' => $nextSide];
-                    $queue[] = ['id' => $parentId, 'distance' => $nextDistance, 'side' => $nextSide];
-                } elseif ($nextDistance === $existingDistance) {
-                    $map[$parentId]['side'] = $this->mergeSide((string)$map[$parentId]['side'], $nextSide);
+                if (!isset($this->people[$pid])) {
+                    continue;
+                }
+                $nextDepth = $depth + 1;
+                $edge = $depth === 0 ? $entry['edge'] : $firstEdge;
+                if (!isset($out[$pid]) || $nextDepth < (int)$out[$pid]['depth']) {
+                    $out[$pid] = ['depth' => $nextDepth, 'first_edge' => $edge];
+                    $queue[] = [$pid, $nextDepth, $edge];
+                    continue;
+                }
+                if ($nextDepth === (int)$out[$pid]['depth'] && (string)$out[$pid]['first_edge'] !== $edge) {
+                    $out[$pid]['first_edge'] = 'both';
                 }
             }
         }
-
-        return $map;
+        $this->ancestorCache[$personId] = $out;
+        return $out;
     }
 
-    private function hasMarriage(int $a, int $b): bool
+    private function areSiblings(int $aId, int $bId): bool
     {
-        $stmt = $this->db->prepare(
-            'SELECT 1 FROM marriages
-             WHERE (person1_id = :a1 AND person2_id = :b1)
-                OR (person1_id = :a2 AND person2_id = :b2)
-             LIMIT 1'
-        );
-        $stmt->execute([':a1' => $a, ':b1' => $b, ':a2' => $b, ':b2' => $a]);
-        return (bool)$stmt->fetch();
-    }
-
-    private function getSpouseIds(int $personId): array
-    {
-        $stmt = $this->db->prepare(
-            'SELECT CASE WHEN person1_id = :id1 THEN person2_id ELSE person1_id END AS spouse_id
-             FROM marriages
-             WHERE person1_id = :id2 OR person2_id = :id3'
-        );
-        $stmt->execute([':id1' => $personId, ':id2' => $personId, ':id3' => $personId]);
-        $rows = $stmt->fetchAll();
-        return array_values(array_unique(array_map(static fn($r) => (int)$r['spouse_id'], $rows)));
-    }
-
-    private function getSiblingIds(int $personId): array
-    {
-        $stmt = $this->db->prepare(
-            'SELECT DISTINCT b.child_id
-             FROM parent_child a
-             INNER JOIN parent_child b ON a.parent_id = b.parent_id
-             WHERE a.child_id = :id AND b.child_id != :id2'
-        );
-        $stmt->execute([':id' => $personId, ':id2' => $personId]);
-        $rows = $stmt->fetchAll();
-        return array_values(array_unique(array_map(static fn($r) => (int)$r['child_id'], $rows)));
-    }
-
-    private function isMarriedToAny(int $personId, array $candidateIds): bool
-    {
-        if (empty($candidateIds)) {
+        $a = $this->people[$aId] ?? null;
+        $b = $this->people[$bId] ?? null;
+        if (!$a || !$b) {
             return false;
         }
-        $placeholders = implode(',', array_fill(0, count($candidateIds), '?'));
-        $stmt = $this->db->prepare(
-            "SELECT 1
-             FROM marriages
-             WHERE ((person1_id = ? AND person2_id IN ($placeholders))
-                 OR (person2_id = ? AND person1_id IN ($placeholders)))
-             LIMIT 1"
-        );
-        $params = array_merge([$personId], $candidateIds, [$personId], $candidateIds);
-        $stmt->execute($params);
-        return (bool)$stmt->fetch();
+        $fatherMatch = (int)$a['father_id'] > 0 && (int)$a['father_id'] === (int)$b['father_id'];
+        $motherMatch = (int)$a['mother_id'] > 0 && (int)$a['mother_id'] === (int)$b['mother_id'];
+        return $fatherMatch || $motherMatch;
     }
 
-    private function isChildOfAny(int $childId, array $parentIds): bool
+    private function areMutualSpouses(int $aId, int $bId): bool
     {
-        if (empty($parentIds)) {
+        $a = $this->people[$aId] ?? null;
+        $b = $this->people[$bId] ?? null;
+        if (!$a || !$b) {
             return false;
         }
-        $placeholders = implode(',', array_fill(0, count($parentIds), '?'));
-        $stmt = $this->db->prepare(
-            "SELECT 1
-             FROM parent_child
-             WHERE child_id = ? AND parent_id IN ($placeholders)
-             LIMIT 1"
-        );
-        $stmt->execute(array_merge([$childId], $parentIds));
-        return (bool)$stmt->fetch();
+        return (int)$a['spouse_id'] === $bId && (int)$b['spouse_id'] === $aId;
+    }
+
+    private function ancestorTitle(int $distance, string $gender, string $side): string
+    {
+        if ($distance === 1) {
+            if ($side === 'Paternal' && $gender === 'male') return 'Father';
+            if ($side === 'Maternal' && $gender === 'female') return 'Mother';
+            return $this->gendered($gender, 'Father', 'Mother', 'Parent');
+        }
+        if ($distance === 2) {
+            if ($side === 'Paternal') {
+                return $this->gendered($gender, 'Paternal Grandfather', 'Paternal Grandmother', 'Paternal Grandparent');
+            }
+            if ($side === 'Maternal') {
+                return $this->gendered($gender, 'Maternal Grandfather', 'Maternal Grandmother', 'Maternal Grandparent');
+            }
+            return $this->gendered($gender, 'Grandfather', 'Grandmother', 'Grandparent');
+        }
+        if ($distance === 3) {
+            return $this->gendered($gender, 'Great Grandfather', 'Great Grandmother', 'Great Grandparent');
+        }
+        if ($distance === 4) {
+            return $this->gendered($gender, 'Great Great Grandfather', 'Great Great Grandmother', 'Great Great Grandparent');
+        }
+        if ($distance === 5) {
+            return $this->gendered($gender, 'Third Great Grandfather', 'Third Great Grandmother', 'Third Great Grandparent');
+        }
+        if ($distance === 6) {
+            return $this->gendered($gender, 'Fourth Great Grandfather', 'Fourth Great Grandmother', 'Fourth Great Grandparent');
+        }
+        return $this->gendered($gender, 'Ancestor', 'Ancestor', 'Ancestor');
+    }
+
+    private function descendantTitle(int $distance, string $gender): string
+    {
+        if ($distance === 1) {
+            return $this->gendered($gender, 'Son', 'Daughter', 'Child');
+        }
+        if ($distance === 2) {
+            return $this->gendered($gender, 'Grandson', 'Granddaughter', 'Grandchild');
+        }
+        if ($distance === 3) {
+            return $this->gendered($gender, 'Great Grandson', 'Great Granddaughter', 'Great Grandchild');
+        }
+        if ($distance === 4) {
+            return $this->gendered($gender, 'Great Great Grandson', 'Great Great Granddaughter', 'Great Great Grandchild');
+        }
+        if ($distance === 5) {
+            return $this->gendered($gender, 'Third Great Grandson', 'Third Great Granddaughter', 'Third Great Grandchild');
+        }
+        if ($distance === 6) {
+            return $this->gendered($gender, 'Fourth Great Grandson', 'Fourth Great Granddaughter', 'Fourth Great Grandchild');
+        }
+        return $this->gendered($gender, 'Descendant', 'Descendant', 'Descendant');
+    }
+
+    private function sideFromEdge(string $edge): string
+    {
+        if ($edge === 'father') return 'Paternal';
+        if ($edge === 'mother') return 'Maternal';
+        if ($edge === 'both') return 'Both';
+        return 'Direct';
+    }
+
+    private function gendered(string $gender, string $male, string $female, string $fallback): string
+    {
+        if ($gender === 'male') return $male;
+        if ($gender === 'female') return $female;
+        return $fallback;
     }
 
     private function result(
-        string $relKey,
-        string $label,
-        string $category,
+        string $title,
+        ?int $degree,
+        ?int $removed,
+        int $generationDifference,
         string $side,
-        int $degree,
-        int $generationDelta,
-        ?int $lcaPersonId,
-        int $stepsFromPerson1,
-        int $stepsFromPerson2
+        ?int $lcaId = null,
+        ?string $lcaName = null
     ): array {
-        $resolvedLabel = $this->dictionaryLabel($relKey, $label);
         return [
-            'rel_key' => $relKey,
-            'label' => $resolvedLabel,
-            'category' => $category,
+            'title' => $title,
+            'cousin_level' => $degree,
+            'removed' => $removed,
+            'generation_difference' => $generationDifference,
             'side' => $side,
-            'degree' => $degree,
-            'generation_delta' => $generationDelta,
-            'lca_person_id' => $lcaPersonId,
-            'steps_from_person1' => $stepsFromPerson1,
-            'steps_from_person2' => $stepsFromPerson2,
+            'lca_id' => $lcaId,
+            'lca_name' => $lcaName,
         ];
     }
 
-    private function toKey(string $label): string
+    private function loadPeople(): void
     {
-        $s = strtolower($label);
-        $s = str_replace(['/', '-', '  '], ['_', '_', ' '], $s);
-        $s = preg_replace('/\s+/', '_', $s);
-        return trim((string)$s, '_');
+        if (!empty($this->people)) {
+            return;
+        }
+        $this->loadPersonColumns();
+        $fatherExpr = isset($this->columns['father_id']) ? 'father_id' : 'NULL';
+        $motherExpr = isset($this->columns['mother_id']) ? 'mother_id' : 'NULL';
+        $spouseExpr = isset($this->columns['spouse_id']) ? 'spouse_id' : 'NULL';
+        $stmt = $this->db->query(
+            "SELECT person_id, full_name, gender,
+                    {$fatherExpr} AS father_id,
+                    {$motherExpr} AS mother_id,
+                    {$spouseExpr} AS spouse_id
+             FROM persons"
+        );
+        $rows = $stmt->fetchAll();
+        foreach ($rows as $row) {
+            $id = (int)$row['person_id'];
+            $fatherId = (int)($row['father_id'] ?? 0);
+            $motherId = (int)($row['mother_id'] ?? 0);
+            $spouseId = (int)($row['spouse_id'] ?? 0);
+            if ($fatherId === $id) $fatherId = 0;
+            if ($motherId === $id) $motherId = 0;
+            if ($spouseId === $id) $spouseId = 0;
+            $row['father_id'] = $fatherId;
+            $row['mother_id'] = $motherId;
+            $row['spouse_id'] = $spouseId;
+            $this->people[$id] = $row;
+        }
     }
 
-    private function cousinKey(int $degree, int $removed): string
+    private function loadPersonColumns(): void
     {
-        if ($removed === 0) {
-            return $this->toKey($this->ordinal($degree) . ' cousin');
+        if (!empty($this->columns)) {
+            return;
         }
-        return $this->toKey($this->ordinal($degree) . ' cousin ' . $this->removedText($removed));
-    }
-
-    private function ancestorDescendantKey(int $distance, string $gender, bool $ancestor, string $side): string
-    {
-        $base = $ancestor
-            ? ($gender === 'male' ? 'father' : ($gender === 'female' ? 'mother' : 'parent'))
-            : ($gender === 'male' ? 'son' : ($gender === 'female' ? 'daughter' : 'child'));
-        if ($distance === 1) {
-            return $base;
-        }
-        if ($distance === 2) {
-            $prefix = $ancestor && in_array($side, ['paternal', 'maternal'], true) ? $side . '_' : '';
-            return $prefix . 'grand' . $base;
-        }
-        if ($distance === 3) {
-            return 'great_grand' . $base;
-        }
-        return $this->ordinal($distance - 2) . '_great_grand' . $base;
-    }
-
-    private function dictionaryLabel(string $relKey, string $fallback): string
-    {
-        if ($relKey === '') {
-            return $fallback;
-        }
-        if ($this->dictionary === null) {
-            $this->dictionary = [];
-            try {
-                $stmt = $this->db->query('SELECT rel_key, label FROM relationship_dictionary');
-                $rows = $stmt->fetchAll();
-                foreach ($rows as $row) {
-                    $k = (string)($row['rel_key'] ?? '');
-                    $v = (string)($row['label'] ?? '');
-                    if ($k !== '' && $v !== '') {
-                        $this->dictionary[$k] = $v;
-                    }
-                }
-            } catch (Throwable $e) {
-                $this->dictionary = [];
+        $stmt = $this->db->query('SHOW COLUMNS FROM persons');
+        foreach ($stmt->fetchAll() as $row) {
+            $field = strtolower((string)($row['Field'] ?? ''));
+            if ($field !== '') {
+                $this->columns[$field] = true;
             }
         }
-        return $this->dictionary[$relKey] ?? $fallback;
-    }
-
-    private function siblingLabel(array $base, array $other): string
-    {
-        $gender = (string)($other['gender'] ?? 'unknown');
-        $baseOrder = $this->comparableBirthOrder($base);
-        $otherOrder = $this->comparableBirthOrder($other);
-
-        if ($gender === 'male') {
-            if ($baseOrder !== null && $otherOrder !== null) {
-                return $otherOrder < $baseOrder ? 'Elder Brother' : 'Younger Brother';
-            }
-            return 'Brother';
-        }
-        if ($gender === 'female') {
-            if ($baseOrder !== null && $otherOrder !== null) {
-                return $otherOrder < $baseOrder ? 'Elder Sister' : 'Younger Sister';
-            }
-            return 'Sister';
-        }
-        return 'Sibling';
-    }
-
-    private function comparableBirthOrder(array $person): ?int
-    {
-        $dob = trim((string)($person['date_of_birth'] ?? ''));
-        if ($dob !== '') {
-            $ts = strtotime($dob);
-            if ($ts !== false) {
-                return (int)$ts;
-            }
-        }
-        $year = (int)($person['birth_year'] ?? 0);
-        if ($year > 0) {
-            return $year;
-        }
-        return null;
-    }
-
-    private function ancestorDescendantLabel(int $distance, string $gender, bool $ancestor, string $side): string
-    {
-        $male = $ancestor ? 'Father' : 'Son';
-        $female = $ancestor ? 'Mother' : 'Daughter';
-        $neutral = $ancestor ? 'Parent' : 'Child';
-        $base = $gender === 'male' ? $male : ($gender === 'female' ? $female : $neutral);
-
-        if ($distance === 1) {
-            return $base;
-        }
-
-        if ($distance === 2) {
-            $baseLower = strtolower($base);
-            $label = 'Grand' . $baseLower;
-            if ($ancestor && $side === 'paternal') {
-                return 'Paternal ' . ucfirst($label);
-            }
-            if ($ancestor && $side === 'maternal') {
-                return 'Maternal ' . ucfirst($label);
-            }
-            return ucfirst($label);
-        }
-
-        if ($distance === 3) {
-            $prefix = $ancestor ? 'Great Grand' : 'Great Grand';
-            $label = $prefix . strtolower($base);
-            return ucfirst($label);
-        }
-
-        $nth = $this->ordinal($distance - 2);
-        return ucfirst($nth . ' great grand' . strtolower($base));
-    }
-
-    private function uncleAuntLabel(int $distance, string $gender, string $side): string
-    {
-        $base = $gender === 'male' ? 'Uncle' : ($gender === 'female' ? 'Aunt' : 'Uncle/Aunt');
-        if ($distance === 2) {
-            if ($side === 'paternal') return "Paternal $base";
-            if ($side === 'maternal') return "Maternal $base";
-            return $base;
-        }
-        return str_repeat('Great ', max(0, $distance - 2)) . $base;
-    }
-
-    private function nephewNieceLabel(int $distance, string $gender, string $side): string
-    {
-        $base = $gender === 'male' ? 'Nephew' : ($gender === 'female' ? 'Niece' : 'Niece/Nephew');
-        if ($distance === 2) {
-            return $base;
-        }
-        return str_repeat('Great ', max(0, $distance - 2)) . $base;
-    }
-
-    private function toInLawLabel(string $bloodLabel, string $gender): string
-    {
-        if (str_contains($bloodLabel, 'Father') || str_contains($bloodLabel, 'Mother') || str_contains($bloodLabel, 'Parent')) {
-            if ($gender === 'male') return 'Father-in-law';
-            if ($gender === 'female') return 'Mother-in-law';
-            return 'Parent-in-law';
-        }
-        if (str_contains($bloodLabel, 'Son') || str_contains($bloodLabel, 'Daughter') || str_contains($bloodLabel, 'Child')) {
-            if ($gender === 'male') return 'Son-in-law';
-            if ($gender === 'female') return 'Daughter-in-law';
-            return 'Child-in-law';
-        }
-        if (str_contains($bloodLabel, 'Brother') || str_contains($bloodLabel, 'Sister') || str_contains($bloodLabel, 'Sibling')) {
-            if ($gender === 'male') return 'Brother-in-law';
-            if ($gender === 'female') return 'Sister-in-law';
-            return 'Sibling-in-law';
-        }
-        if (str_contains($bloodLabel, 'Cousin')) {
-            return 'Cousin-in-law';
-        }
-        if (str_contains($bloodLabel, 'Uncle') || str_contains($bloodLabel, 'Aunt')) {
-            return str_contains($bloodLabel, 'Aunt') ? 'Aunt-in-law' : 'Uncle-in-law';
-        }
-        if (str_contains($bloodLabel, 'Nephew') || str_contains($bloodLabel, 'Niece')) {
-            return str_contains($bloodLabel, 'Niece') ? 'Niece-in-law' : 'Nephew-in-law';
-        }
-        return 'In-law';
-    }
-
-    private function siblingSpouseLabel(string $gender): string
-    {
-        if ($gender === 'male') {
-            return 'Brother-in-law';
-        }
-        if ($gender === 'female') {
-            return 'Sister-in-law';
-        }
-        return 'Sibling-in-law';
-    }
-
-    private function nextSide(string $currentSide, string $parentType, int $currentDistance): string
-    {
-        $parentSide = match ($parentType) {
-            'father' => 'paternal',
-            'mother' => 'maternal',
-            default => 'both',
-        };
-
-        if ($currentDistance === 0) {
-            return $parentSide;
-        }
-        if ($currentSide === 'both' || $parentSide === 'both') {
-            return 'both';
-        }
-        return $currentSide === $parentSide ? $currentSide : 'both';
-    }
-
-    private function mergeSide(string $a, string $b): string
-    {
-        if ($a === $b) return $a;
-        if ($a === 'in_law' || $b === 'in_law') return 'in_law';
-        if ($a === 'both' || $b === 'both') return 'both';
-        return 'both';
     }
 
     private function ordinal(int $n): string
     {
-        $words = [1 => 'first', 2 => 'second', 3 => 'third', 4 => 'fourth', 5 => 'fifth', 6 => 'sixth'];
+        $words = [
+            1 => 'First',
+            2 => 'Second',
+            3 => 'Third',
+            4 => 'Fourth',
+            5 => 'Fifth',
+            6 => 'Sixth',
+            7 => 'Seventh',
+            8 => 'Eighth',
+            9 => 'Ninth',
+            10 => 'Tenth',
+        ];
         if (isset($words[$n])) {
             return $words[$n];
         }
-        $mod100 = $n % 100;
-        if ($mod100 >= 11 && $mod100 <= 13) {
-            return $n . 'th';
-        }
-        $mod10 = $n % 10;
-        if ($mod10 === 1) return $n . 'st';
-        if ($mod10 === 2) return $n . 'nd';
-        if ($mod10 === 3) return $n . 'rd';
         return $n . 'th';
     }
 
     private function removedText(int $n): string
     {
-        return match ($n) {
-            1 => 'once removed',
-            2 => 'twice removed',
-            3 => 'thrice removed',
-            default => $n . ' times removed',
-        };
+        if ($n === 1) return 'Once Removed';
+        if ($n === 2) return 'Twice Removed';
+        if ($n === 3) return 'Thrice Removed';
+        return $n . ' Times Removed';
     }
 }
+

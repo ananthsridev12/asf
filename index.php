@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 declare(strict_types=1);
 
 // index.php - simple front controller
@@ -191,22 +191,6 @@ switch ($route) {
             $memberController->createFamilyMember();
         } else {
             $memberController->showAddFamilyMember();
-        }
-        break;
-
-    case 'member-person-edit':
-        require_role('member');
-        if ($method === 'POST') {
-            $memberController->updateFamilyMember();
-        } else {
-            $memberController->showEditFamilyMember();
-        }
-        break;
-
-    case 'member-parent-add':
-        require_role('member');
-        if ($method === 'POST') {
-            $memberController->addParentFromEdit();
         }
         break;
 

@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 declare(strict_types=1);
 
 // controllers/MemberController.php
@@ -10,6 +10,7 @@ final class MemberController
     private BranchModel $branches;
     private ActivityLogModel $logs;
     private RelationshipEngine $relationshipEngine;
+    private ?array $personColumns = null;
 
     public function __construct(PDO $db)
     {
@@ -17,7 +18,7 @@ final class MemberController
         $this->persons = new PersonModel($db);
         $this->branches = new BranchModel($db);
         $this->logs = new ActivityLogModel($db);
-        $this->relationshipEngine = new RelationshipEngine($db, $this->persons);
+        $this->relationshipEngine = new RelationshipEngine($db);
     }
 
     public function dashboard(): void
@@ -199,6 +200,7 @@ final class MemberController
         $items = $this->persons->listPaginated($page, $perPage);
         $pages = (int)ceil($total / $perPage);
         $relations = [];
+        $relationDetails = [];
         $branchRows = $this->branches->all();
         $branchMap = [];
         foreach ($branchRows as $b) {
@@ -215,12 +217,11 @@ final class MemberController
         unset($item);
 
         if ($basePersonId > 0) {
-            $base = $this->persons->getById($basePersonId);
-            if ($base) {
-                foreach ($items as $item) {
-                    $meta = $this->relationshipEngine->calculate($base, $item);
-                    $relations[(int)$item['person_id']] = (string)($meta['label'] ?? 'No direct relationship');
-                }
+            $ids = array_map(static fn($row): int => (int)$row['person_id'], $items);
+            $map = $this->relationshipEngine->getRelationshipMapForRoot($basePersonId, $ids);
+            foreach ($ids as $id) {
+                $relations[$id] = (string)($map[$id]['relationship'] ?? 'No relationship');
+                $relationDetails[$id] = $map[$id] ?? [];
             }
         }
 
@@ -234,30 +235,6 @@ final class MemberController
         unset($_SESSION['flash_error'], $_SESSION['flash_success']);
 
         include __DIR__ . '/../views/member/person_add.php';
-    }
-
-    public function showEditFamilyMember(): void
-    {
-        $id = (int)($_GET['id'] ?? 0);
-        [$basePerson, $person] = $this->assertMemberCanManagePerson($id);
-
-        $error = $_SESSION['flash_error'] ?? null;
-        $success = $_SESSION['flash_success'] ?? null;
-        unset($_SESSION['flash_error'], $_SESSION['flash_success']);
-
-        $branches = $this->branches->all();
-
-        $parentsStmt = $this->db->prepare(
-            'SELECT pc.parent_id, pc.parent_type, pc.birth_order, p.full_name
-             FROM parent_child pc
-             INNER JOIN persons p ON p.person_id = pc.parent_id
-             WHERE pc.child_id = :id
-             ORDER BY pc.parent_type'
-        );
-        $parentsStmt->execute([':id' => $id]);
-        $parentRows = $parentsStmt->fetchAll();
-
-        include __DIR__ . '/../views/member/person_edit.php';
     }
 
     public function createFamilyMember(): void
@@ -280,8 +257,6 @@ final class MemberController
 
         $existingPersonId = (int)($_POST['existing_person_id'] ?? 0);
         $referencePersonId = (int)($_POST['reference_person_id'] ?? 0);
-        $parentPersonId = (int)($_POST['parent_person_id'] ?? 0);
-        $parentLinkType = (string)($_POST['parent_link_type'] ?? 'father');
         $fullName = trim($_POST['full_name'] ?? '');
         $gender = $_POST['gender'] ?? 'unknown';
         $dateOfBirth = trim($_POST['date_of_birth'] ?? '');
@@ -306,11 +281,6 @@ final class MemberController
         $allowedParentTypes = ['father','mother','adoptive','step'];
         if ($relationType === 'child' && !in_array($parentType, $allowedParentTypes, true)) {
             $_SESSION['flash_error'] = 'Select valid parent type for child relation.';
-            header('Location: /index.php?route=member-person-add');
-            exit;
-        }
-        if ($parentPersonId > 0 && !in_array($parentLinkType, $allowedParentTypes, true)) {
-            $_SESSION['flash_error'] = 'Invalid parent link type.';
             header('Location: /index.php?route=member-person-add');
             exit;
         }
@@ -394,21 +364,6 @@ final class MemberController
                 $bo
             );
 
-            if ($parentPersonId > 0) {
-                if ($parentPersonId === $targetPersonId) {
-                    throw new RuntimeException('Parent and child cannot be the same person.');
-                }
-                $parentPerson = $this->persons->getById($parentPersonId);
-                if (!$parentPerson) {
-                    throw new RuntimeException('Selected parent not found.');
-                }
-                if ((int)$parentPerson['branch_id'] !== (int)$basePerson['branch_id']) {
-                    throw new RuntimeException('Selected parent must be in your family line.');
-                }
-                $this->upsertParentChild($parentPersonId, $targetPersonId, $parentLinkType, null);
-                $this->rebuildSubtreeForChild($targetPersonId, $parentPersonId);
-            }
-
             if ($userId > 0) {
                 $this->logs->log($userId, 'member_added_family_person', $targetPersonId);
             }
@@ -425,138 +380,6 @@ final class MemberController
             header('Location: /index.php?route=member-person-add');
             exit;
         }
-    }
-
-    public function updateFamilyMember(): void
-    {
-        $id = (int)($_POST['person_id'] ?? 0);
-        $token = $_POST['csrf_token'] ?? '';
-        if (!verify_csrf($token)) {
-            $_SESSION['flash_error'] = 'Invalid CSRF token.';
-            header('Location: /index.php?route=member-person-edit&id=' . $id);
-            exit;
-        }
-
-        [, $person] = $this->assertMemberCanManagePerson($id);
-
-        $fullName = trim($_POST['full_name'] ?? '');
-        $gender = $_POST['gender'] ?? 'unknown';
-        $dateOfBirth = trim($_POST['date_of_birth'] ?? '');
-        $birthYear = trim($_POST['birth_year'] ?? '');
-        $dateOfDeath = trim($_POST['date_of_death'] ?? '');
-        $bloodGroup = trim($_POST['blood_group'] ?? '');
-        $occupation = trim($_POST['occupation'] ?? '');
-        $mobile = trim($_POST['mobile'] ?? '');
-        $email = trim($_POST['email'] ?? '');
-        $address = trim($_POST['address'] ?? '');
-        $currentLocation = trim($_POST['current_location'] ?? '');
-        $nativeLocation = trim($_POST['native_location'] ?? '');
-        $isAlive = isset($_POST['is_alive']) ? 1 : 0;
-
-        if ($fullName === '') {
-            $_SESSION['flash_error'] = 'Full name is required.';
-            header('Location: /index.php?route=member-person-edit&id=' . $id);
-            exit;
-        }
-
-        $allowedGenders = ['male','female','other','unknown'];
-        if (!in_array($gender, $allowedGenders, true)) {
-            $gender = 'unknown';
-        }
-
-        $dob = $dateOfBirth !== '' ? $dateOfBirth : null;
-        $by = $birthYear !== '' ? (int)$birthYear : null;
-        $dod = $dateOfDeath !== '' ? $dateOfDeath : null;
-
-        $stmt = $this->db->prepare(
-            'UPDATE persons SET
-                full_name = :full_name,
-                gender = :gender,
-                date_of_birth = :date_of_birth,
-                birth_year = :birth_year,
-                date_of_death = :date_of_death,
-                blood_group = :blood_group,
-                occupation = :occupation,
-                mobile = :mobile,
-                email = :email,
-                address = :address,
-                current_location = :current_location,
-                native_location = :native_location,
-                is_alive = :is_alive
-             WHERE person_id = :id'
-        );
-        $stmt->execute([
-            ':full_name' => $fullName,
-            ':gender' => $gender,
-            ':date_of_birth' => $dob,
-            ':birth_year' => $by,
-            ':date_of_death' => $dod,
-            ':blood_group' => $bloodGroup !== '' ? $bloodGroup : null,
-            ':occupation' => $occupation !== '' ? $occupation : null,
-            ':mobile' => $mobile !== '' ? $mobile : null,
-            ':email' => $email !== '' ? $email : null,
-            ':address' => $address !== '' ? $address : null,
-            ':current_location' => $currentLocation !== '' ? $currentLocation : null,
-            ':native_location' => $nativeLocation !== '' ? $nativeLocation : null,
-            ':is_alive' => $isAlive,
-            ':id' => $id,
-        ]);
-
-        if (!empty($_SESSION['user']['user_id'])) {
-            $this->logs->log((int)$_SESSION['user']['user_id'], 'member_family_person_updated', $id);
-        }
-
-        $_SESSION['flash_success'] = 'Person updated.';
-        header('Location: /index.php?route=member-person-edit&id=' . $id);
-        exit;
-    }
-
-    public function addParentFromEdit(): void
-    {
-        $childId = (int)($_POST['child_id'] ?? 0);
-        $token = $_POST['csrf_token'] ?? '';
-        if (!verify_csrf($token)) {
-            $_SESSION['flash_error'] = 'Invalid CSRF token.';
-            header('Location: /index.php?route=member-person-edit&id=' . $childId);
-            exit;
-        }
-
-        [$basePerson, $person] = $this->assertMemberCanManagePerson($childId);
-
-        $parentId = (int)($_POST['parent_id'] ?? 0);
-        $parentType = (string)($_POST['parent_type'] ?? '');
-        $birthOrder = trim($_POST['birth_order'] ?? '');
-        $bo = $birthOrder !== '' ? (int)$birthOrder : null;
-
-        $allowedParentTypes = ['father','mother','adoptive','step'];
-        if ($parentId <= 0 || !in_array($parentType, $allowedParentTypes, true)) {
-            $_SESSION['flash_error'] = 'Invalid parent data.';
-            header('Location: /index.php?route=member-person-edit&id=' . $childId);
-            exit;
-        }
-        if ($parentId === $childId) {
-            $_SESSION['flash_error'] = 'Parent and child cannot be same person.';
-            header('Location: /index.php?route=member-person-edit&id=' . $childId);
-            exit;
-        }
-
-        $parent = $this->persons->getById($parentId);
-        if (!$parent || (int)$parent['branch_id'] !== (int)$basePerson['branch_id']) {
-            $_SESSION['flash_error'] = 'Selected parent must be in your family line.';
-            header('Location: /index.php?route=member-person-edit&id=' . $childId);
-            exit;
-        }
-
-        $this->upsertParentChild($parentId, $childId, $parentType, $bo);
-        $this->rebuildSubtreeForChild($childId, $parentId);
-
-        if (!empty($_SESSION['user']['user_id'])) {
-            $this->logs->log((int)$_SESSION['user']['user_id'], 'member_parent_assigned', $childId);
-        }
-
-        $_SESSION['flash_success'] = 'Parent assigned.';
-        header('Location: /index.php?route=member-person-edit&id=' . $childId);
-        exit;
     }
 
     public function showAddMarriage(): void
@@ -648,6 +471,12 @@ final class MemberController
                 ':dd' => $divorceDate !== '' ? $divorceDate : null,
                 ':status' => $status,
             ]);
+
+            if ($this->hasPersonColumn('spouse_id')) {
+                $upd = $this->db->prepare('UPDATE persons SET spouse_id = :spouse WHERE person_id = :id');
+                $upd->execute([':spouse' => $person2Id, ':id' => $person1Id]);
+                $upd->execute([':spouse' => $person1Id, ':id' => $person2Id]);
+            }
 
             if ($userId > 0) {
                 $this->logs->log($userId, 'member_added_marriage', $person1Id);
@@ -850,24 +679,7 @@ final class MemberController
 
         $result = null;
         if ($person1 && $person2) {
-            $meta = $this->relationshipEngine->calculate($person1, $person2);
-            if (($meta['label'] ?? '') !== 'No direct relationship') {
-                $lcaPerson = null;
-                if (!empty($meta['lca_person_id'])) {
-                    $lcaPerson = $this->persons->getById((int)$meta['lca_person_id']);
-                }
-                $result = [
-                    'type' => 'explicit',
-                    'label' => (string)$meta['label'],
-                    'category' => (string)($meta['category'] ?? ''),
-                    'side' => (string)($meta['side'] ?? ''),
-                    'degree' => (int)($meta['degree'] ?? 0),
-                    'generation_delta' => (int)($meta['generation_delta'] ?? 0),
-                    'lca' => $lcaPerson,
-                    'gen1' => (int)($meta['steps_from_person1'] ?? 0),
-                    'gen2' => (int)($meta['steps_from_person2'] ?? 0),
-                ];
-            }
+            $result = $this->relationshipEngine->getRelationship((int)$person1['person_id'], (int)$person2['person_id']);
         }
 
         include __DIR__ . '/../views/member/relationship.php';
@@ -900,32 +712,6 @@ final class MemberController
         header('Content-Type: application/json; charset=utf-8');
         echo json_encode($rows);
         exit;
-    }
-
-    private function assertMemberCanManagePerson(int $personId): array
-    {
-        $basePersonId = (int)($_SESSION['user']['person_id'] ?? 0);
-        $basePerson = $basePersonId > 0 ? $this->persons->getById($basePersonId) : null;
-        if (!$basePerson) {
-            http_response_code(403);
-            echo 'Complete your profile first.';
-            exit;
-        }
-
-        $person = $this->persons->getById($personId);
-        if (!$person) {
-            http_response_code(404);
-            echo 'Person not found';
-            exit;
-        }
-
-        if ((int)$person['branch_id'] !== (int)$basePerson['branch_id']) {
-            http_response_code(403);
-            echo '403 - Forbidden';
-            exit;
-        }
-
-        return [$basePerson, $person];
     }
 
     private function createMemberOwnedPerson(
@@ -1055,6 +841,15 @@ final class MemberController
             ':parent_type' => $parentType,
             ':birth_order' => $birthOrder,
         ]);
+
+        if ($parentType === 'father' && $this->hasPersonColumn('father_id')) {
+            $upd = $this->db->prepare('UPDATE persons SET father_id = :pid WHERE person_id = :cid AND (father_id IS NULL OR father_id = 0)');
+            $upd->execute([':pid' => $parentId, ':cid' => $childId]);
+        }
+        if ($parentType === 'mother' && $this->hasPersonColumn('mother_id')) {
+            $upd = $this->db->prepare('UPDATE persons SET mother_id = :pid WHERE person_id = :cid AND (mother_id IS NULL OR mother_id = 0)');
+            $upd->execute([':pid' => $parentId, ':cid' => $childId]);
+        }
     }
 
     private function upsertMarriage(int $p1, int $p2): void
@@ -1085,6 +880,12 @@ final class MemberController
             ':dd' => null,
             ':status' => 'married',
         ]);
+
+        if ($this->hasPersonColumn('spouse_id')) {
+            $upd = $this->db->prepare('UPDATE persons SET spouse_id = :spouse WHERE person_id = :id');
+            $upd->execute([':spouse' => $p2, ':id' => $p1]);
+            $upd->execute([':spouse' => $p1, ':id' => $p2]);
+        }
     }
 
     private function fetchOneParentOf(int $childId): ?array
@@ -1168,34 +969,26 @@ final class MemberController
         }
 
         $fatherName = null;
-        $fatherStmt = $this->db->prepare(
-            'SELECT p.full_name
-             FROM parent_child pc
-             INNER JOIN persons p ON p.person_id = pc.parent_id
-             WHERE pc.child_id = :id AND pc.parent_type = :ptype
-             LIMIT 1'
-        );
-        $fatherStmt->execute([':id' => $personId, ':ptype' => 'father']);
-        $frow = $fatherStmt->fetch();
-        if ($frow && !empty($frow['full_name'])) {
-            $fatherName = (string)$frow['full_name'];
+        if ($this->hasPersonColumn('father_id')) {
+            $fatherStmt = $this->db->prepare('SELECT p.full_name FROM persons c INNER JOIN persons p ON p.person_id = c.father_id WHERE c.person_id = :id LIMIT 1');
+            $fatherStmt->execute([':id' => $personId]);
+            $frow = $fatherStmt->fetch();
+            if ($frow && !empty($frow['full_name'])) {
+                $fatherName = (string)$frow['full_name'];
+            }
         }
 
         $husbandName = null;
-        if ((string)($person['gender'] ?? '') === 'female') {
+        if ((string)($person['gender'] ?? '') === 'female' && $this->hasPersonColumn('spouse_id')) {
             $husbandStmt = $this->db->prepare(
                 'SELECT p.full_name
-                 FROM marriages m
-                 INNER JOIN persons p
-                   ON p.person_id = CASE WHEN m.person1_id = :id1 THEN m.person2_id ELSE m.person1_id END
-                 WHERE (m.person1_id = :id2 OR m.person2_id = :id3) AND p.gender = :g
-                 ORDER BY m.marriage_id DESC
+                 FROM persons c
+                 INNER JOIN persons p ON p.person_id = c.spouse_id
+                 WHERE c.person_id = :id AND p.gender = :g
                  LIMIT 1'
             );
             $husbandStmt->execute([
-                ':id1' => $personId,
-                ':id2' => $personId,
-                ':id3' => $personId,
+                ':id' => $personId,
                 ':g' => 'male',
             ]);
             $hrow = $husbandStmt->fetch();
@@ -1217,11 +1010,12 @@ final class MemberController
 
     private function getExplicitRelationship(array $base, array $other): string
     {
-        $meta = $this->relationshipEngine->calculate($base, $other);
-        return (string)($meta['label'] ?? 'No direct relationship');
-
         $baseId = (int)$base['person_id'];
         $otherId = (int)$other['person_id'];
+
+        if ($baseId === $otherId) {
+            return 'Self';
+        }
 
         $spouseStmt = $this->db->prepare(
             'SELECT 1
@@ -1271,11 +1065,6 @@ final class MemberController
                 return $this->ordinal((int)$birthOrder) . ' ' . $childLabel;
             }
             return ucfirst($childLabel);
-        }
-
-        $blood = $this->getBloodRelationshipLabel($base, $other);
-        if ($blood !== null) {
-            return $blood;
         }
 
         // In-law check: other is parent of base person's spouse.
@@ -1392,41 +1181,6 @@ final class MemberController
             }
         }
 
-        // Co-sibling-in-law: spouse of base spouse's sibling (e.g., wife vs brother's wife).
-        if (!empty($spouseIds)) {
-            $spousePlaceholders = implode(',', array_fill(0, count($spouseIds), '?'));
-            $spouseSiblingStmt = $this->db->prepare(
-                "SELECT DISTINCT b.child_id
-                 FROM parent_child a
-                 INNER JOIN parent_child b ON a.parent_id = b.parent_id
-                 WHERE a.child_id IN ($spousePlaceholders) AND b.child_id NOT IN ($spousePlaceholders)"
-            );
-            $spouseSiblingStmt->execute(array_merge($spouseIds, $spouseIds));
-            $spouseSiblingRows = $spouseSiblingStmt->fetchAll();
-            if (!empty($spouseSiblingRows)) {
-                $spouseSiblingIds = array_map(static fn($r) => (int)$r['child_id'], $spouseSiblingRows);
-                $sibPlaceholders = implode(',', array_fill(0, count($spouseSiblingIds), '?'));
-                $coInLawStmt = $this->db->prepare(
-                    "SELECT 1
-                     FROM marriages
-                     WHERE ((person1_id IN ($sibPlaceholders) AND person2_id = ?)
-                         OR (person2_id IN ($sibPlaceholders) AND person1_id = ?))
-                     LIMIT 1"
-                );
-                $params = array_merge($spouseSiblingIds, [$otherId], $spouseSiblingIds, [$otherId]);
-                $coInLawStmt->execute($params);
-                if ($coInLawStmt->fetch() && !in_array($otherId, $spouseIds, true)) {
-                    $baseGender = (string)($base['gender'] ?? 'unknown');
-                    $otherGender = (string)($other['gender'] ?? 'unknown');
-                    if ($baseGender === 'female' && $otherGender === 'female') return 'Co-sister';
-                    if ($baseGender === 'male' && $otherGender === 'male') return 'Co-brother';
-                    if ($otherGender === 'male') return 'Brother-in-law';
-                    if ($otherGender === 'female') return 'Sister-in-law';
-                    return 'In-law';
-                }
-            }
-        }
-
         // If two people share child(ren), they're co-parents even if no marriage row exists.
         $coParentStmt = $this->db->prepare(
             'SELECT 1
@@ -1455,159 +1209,35 @@ final class MemberController
             return 'Sibling';
         }
 
-        return 'No direct relationship';
-    }
+        $basePath = trim((string)$base['lineage_path'], '/');
+        $otherPath = trim((string)$other['lineage_path'], '/');
+        $baseIds = $basePath === '' ? [] : array_map('intval', explode('/', $basePath));
+        $otherIds = $otherPath === '' ? [] : array_map('intval', explode('/', $otherPath));
 
-    private function getBloodRelationshipLabel(array $base, array $other): ?string
-    {
-        $baseId = (int)$base['person_id'];
-        $otherId = (int)$other['person_id'];
-        $otherGender = (string)($other['gender'] ?? 'unknown');
-
-        $baseMap = $this->getAncestorDistanceMap($baseId);
-        $otherMap = $this->getAncestorDistanceMap($otherId);
-
-        if (isset($baseMap[$otherId])) {
-            return $this->linealLabel($baseMap[$otherId], $otherGender, true);
-        }
-
-        if (isset($otherMap[$baseId])) {
-            return $this->linealLabel($otherMap[$baseId], $otherGender, false);
-        }
-
-        $common = array_intersect(array_keys($baseMap), array_keys($otherMap));
-        if (empty($common)) {
-            return null;
-        }
-
-        $bestAncestor = null;
-        $bestSum = PHP_INT_MAX;
-        $bestMax = PHP_INT_MAX;
-        foreach ($common as $aid) {
-            $d1 = $baseMap[(int)$aid];
-            $d2 = $otherMap[(int)$aid];
-            $sum = $d1 + $d2;
-            $max = max($d1, $d2);
-            if ($sum < $bestSum || ($sum === $bestSum && $max < $bestMax)) {
-                $bestSum = $sum;
-                $bestMax = $max;
-                $bestAncestor = (int)$aid;
-            }
-        }
-
-        if ($bestAncestor === null) {
-            return null;
-        }
-
-        $d1 = $baseMap[$bestAncestor];
-        $d2 = $otherMap[$bestAncestor];
-
-        if ($d1 === 1 && $d2 === 1) {
-            if ($otherGender === 'male') return 'Brother';
-            if ($otherGender === 'female') return 'Sister';
-            return 'Sibling';
-        }
-
-        // Other is descendant of base's sibling.
-        if ($d1 === 1 && $d2 >= 2) {
-            return $this->nephewNieceLabel($d2, $otherGender);
-        }
-
-        // Other is sibling of base's parent/grandparent line.
-        if ($d2 === 1 && $d1 >= 2) {
-            return $this->uncleAuntLabel($d1, $otherGender);
-        }
-
-        $minD = min($d1, $d2);
-        if ($minD >= 2) {
-            $degree = $minD - 1;
-            $removed = abs($d1 - $d2);
-            $label = $this->ordinal($degree) . ' cousin';
-            if ($removed > 0) {
-                $label .= ' ' . $this->removedText($removed);
-            }
-            return ucfirst($label);
-        }
-
-        return null;
-    }
-
-    private function getAncestorDistanceMap(int $personId, int $maxDepth = 12): array
-    {
-        $map = [$personId => 0];
-        $queue = [[$personId, 0]];
-        $stmt = $this->db->prepare('SELECT parent_id FROM parent_child WHERE child_id = :id');
-
-        while (!empty($queue)) {
-            [$currentId, $depth] = array_shift($queue);
-            if ($depth >= $maxDepth) {
-                continue;
-            }
-
-            $stmt->execute([':id' => (int)$currentId]);
-            $rows = $stmt->fetchAll();
-            foreach ($rows as $row) {
-                $pid = (int)$row['parent_id'];
-                $nextDepth = $depth + 1;
-                if (!isset($map[$pid]) || $nextDepth < $map[$pid]) {
-                    $map[$pid] = $nextDepth;
-                    $queue[] = [$pid, $nextDepth];
+        if (!empty($baseIds) && !empty($otherIds)) {
+            if (in_array($otherId, $baseIds, true)) {
+                $distance = count($baseIds) - array_search($otherId, $baseIds, true) - 1;
+                if ($distance === 1) {
+                    return ((string)($other['gender'] ?? '') === 'female') ? 'Mother' : 'Father';
                 }
+                if ($distance === 2) {
+                    return ((string)($other['gender'] ?? '') === 'female') ? 'Grandmother' : 'Grandfather';
+                }
+                return 'Ancestor';
+            }
+            if (in_array($baseId, $otherIds, true)) {
+                $distance = count($otherIds) - array_search($baseId, $otherIds, true) - 1;
+                if ($distance === 1) {
+                    return ((string)($other['gender'] ?? '') === 'female') ? 'Daughter' : 'Son';
+                }
+                if ($distance === 2) {
+                    return ((string)($other['gender'] ?? '') === 'female') ? 'Granddaughter' : 'Grandson';
+                }
+                return 'Descendant';
             }
         }
 
-        return $map;
-    }
-
-    private function linealLabel(int $distance, string $gender, bool $isAncestor): string
-    {
-        $maleBase = $isAncestor ? 'Father' : 'Son';
-        $femaleBase = $isAncestor ? 'Mother' : 'Daughter';
-        $neutralBase = $isAncestor ? 'Parent' : 'Child';
-
-        $base = $neutralBase;
-        if ($gender === 'male') {
-            $base = $maleBase;
-        } elseif ($gender === 'female') {
-            $base = $femaleBase;
-        }
-
-        if ($distance <= 1) {
-            return $base;
-        }
-        if ($distance === 2) {
-            return 'Grand' . strtolower($base);
-        }
-
-        return str_repeat('Great-', $distance - 2) . 'Grand' . strtolower($base);
-    }
-
-    private function uncleAuntLabel(int $distanceFromCommonParent, string $gender): string
-    {
-        $base = 'Uncle/Aunt';
-        if ($gender === 'male') {
-            $base = 'Uncle';
-        } elseif ($gender === 'female') {
-            $base = 'Aunt';
-        }
-        if ($distanceFromCommonParent === 2) {
-            return $base;
-        }
-        return str_repeat('Great-', max(0, $distanceFromCommonParent - 2)) . $base;
-    }
-
-    private function nephewNieceLabel(int $distanceFromCommonParent, string $gender): string
-    {
-        $base = 'Niece/Nephew';
-        if ($gender === 'male') {
-            $base = 'Nephew';
-        } elseif ($gender === 'female') {
-            $base = 'Niece';
-        }
-        if ($distanceFromCommonParent === 2) {
-            return $base;
-        }
-        return str_repeat('Great-', max(0, $distanceFromCommonParent - 2)) . $base;
+        return 'No direct relationship';
     }
 
     private function describeLineageRelationship(int $gen1, int $gen2, string $otherGender): ?string
@@ -1692,6 +1322,21 @@ final class MemberController
         }
 
         return null;
+    }
+
+    private function hasPersonColumn(string $column): bool
+    {
+        if ($this->personColumns === null) {
+            $this->personColumns = [];
+            $stmt = $this->db->query('SHOW COLUMNS FROM persons');
+            foreach ($stmt->fetchAll() as $row) {
+                $field = strtolower((string)($row['Field'] ?? ''));
+                if ($field !== '') {
+                    $this->personColumns[$field] = true;
+                }
+            }
+        }
+        return isset($this->personColumns[strtolower($column)]);
     }
 
     private function ordinal(int $n): string

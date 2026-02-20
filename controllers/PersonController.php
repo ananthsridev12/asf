@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 declare(strict_types=1);
 
 // controllers/PersonController.php
@@ -9,6 +9,7 @@ final class PersonController
     private PersonModel $persons;
     private BranchModel $branches;
     private ActivityLogModel $logs;
+    private ?array $personColumns = null;
 
     public function __construct(PDO $db)
     {
@@ -359,6 +360,15 @@ final class PersonController
             ':birth_order' => $bo,
         ]);
 
+        if ($parentType === 'father' && $this->hasPersonColumn('father_id')) {
+            $upd = $this->db->prepare('UPDATE persons SET father_id = :pid WHERE person_id = :cid AND (father_id IS NULL OR father_id = 0)');
+            $upd->execute([':pid' => $parentId, ':cid' => $id]);
+        }
+        if ($parentType === 'mother' && $this->hasPersonColumn('mother_id')) {
+            $upd = $this->db->prepare('UPDATE persons SET mother_id = :pid WHERE person_id = :cid AND (mother_id IS NULL OR mother_id = 0)');
+            $upd->execute([':pid' => $parentId, ':cid' => $id]);
+        }
+
         if (!empty($_SESSION['user']['user_id'])) {
             $this->logs->log((int)$_SESSION['user']['user_id'], 'parent_assigned', $id);
         }
@@ -401,6 +411,12 @@ final class PersonController
             ':dd' => $divorceDate !== '' ? $divorceDate : null,
             ':status' => $status,
         ]);
+
+        if ($this->hasPersonColumn('spouse_id')) {
+            $upd = $this->db->prepare('UPDATE persons SET spouse_id = :spouse WHERE person_id = :id');
+            $upd->execute([':spouse' => $spouseId, ':id' => $id]);
+            $upd->execute([':spouse' => $id, ':id' => $spouseId]);
+        }
 
         if (!empty($_SESSION['user']['user_id'])) {
             $this->logs->log((int)$_SESSION['user']['user_id'], 'marriage_created', $id);
@@ -568,5 +584,20 @@ final class PersonController
             $parts[] = 'H: ' . $husbandName;
         }
         return implode(' | ', $parts);
+    }
+
+    private function hasPersonColumn(string $column): bool
+    {
+        if ($this->personColumns === null) {
+            $this->personColumns = [];
+            $stmt = $this->db->query('SHOW COLUMNS FROM persons');
+            foreach ($stmt->fetchAll() as $row) {
+                $field = strtolower((string)($row['Field'] ?? ''));
+                if ($field !== '') {
+                    $this->personColumns[$field] = true;
+                }
+            }
+        }
+        return isset($this->personColumns[strtolower($column)]);
     }
 }

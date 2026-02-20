@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 // views/member/relationship.php
 require_role('member');
 ?>
@@ -46,37 +46,21 @@ require_role('member');
     </form>
 
     <?php if ($person1 && $person2): ?>
-      <?php if ($result && ($result['type'] ?? '') === 'spouse'): ?>
+      <?php if ($result): ?>
         <div class="alert alert-success">
-          Relationship: <strong>Spouse</strong><br>
-          Status: <?php echo htmlspecialchars((string)($result['marriage']['status'] ?? ''), ENT_QUOTES, 'UTF-8'); ?><br>
-          Marriage date: <?php echo htmlspecialchars((string)($result['marriage']['marriage_date'] ?? ''), ENT_QUOTES, 'UTF-8'); ?>
-        </div>
-      <?php elseif ($result && ($result['type'] ?? '') === 'explicit'): ?>
-        <div class="alert alert-success">
-          Relationship: <strong><?php echo htmlspecialchars((string)($result['label'] ?? ''), ENT_QUOTES, 'UTF-8'); ?></strong>
-          <br>
-          Category: <?php echo htmlspecialchars((string)($result['category'] ?? ''), ENT_QUOTES, 'UTF-8'); ?> |
-          Side: <?php echo htmlspecialchars((string)($result['side'] ?? ''), ENT_QUOTES, 'UTF-8'); ?> |
-          Degree: <?php echo (int)($result['degree'] ?? 0); ?> |
-          Generation Delta: <?php echo (int)($result['generation_delta'] ?? 0); ?>
-          <?php if (!empty($result['lca'])): ?>
-            <br>
-            Closest common ancestor: <strong><?php echo htmlspecialchars((string)$result['lca']['full_name'], ENT_QUOTES, 'UTF-8'); ?></strong>
-            (ID: <?php echo (int)$result['lca']['person_id']; ?>)<br>
-            Person 1 distance: <?php echo (int)($result['gen1'] ?? 0); ?> generations<br>
-            Person 2 distance: <?php echo (int)($result['gen2'] ?? 0); ?> generations
+          Relationship: <strong><?php echo htmlspecialchars((string)($result['title'] ?? ''), ENT_QUOTES, 'UTF-8'); ?></strong><br>
+          Side: <?php echo htmlspecialchars((string)($result['side'] ?? 'Direct'), ENT_QUOTES, 'UTF-8'); ?><br>
+          Generation distance: <?php echo (int)($result['generation_difference'] ?? 0); ?><br>
+          <?php if (($result['cousin_level'] ?? null) !== null): ?>
+            Cousin level: <?php echo (int)$result['cousin_level']; ?><br>
           <?php endif; ?>
-        </div>
-      <?php elseif ($result && ($result['type'] ?? '') === 'lineage' && !empty($result['lca'])): ?>
-        <div class="alert alert-success">
-          <?php if (!empty($result['label'])): ?>
-            Relationship: <strong><?php echo htmlspecialchars((string)$result['label'], ENT_QUOTES, 'UTF-8'); ?></strong><br>
+          <?php if (($result['removed'] ?? null) !== null): ?>
+            Removed: <?php echo (int)$result['removed']; ?><br>
           <?php endif; ?>
-          Closest common ancestor: <strong><?php echo htmlspecialchars($result['lca']['full_name'], ENT_QUOTES, 'UTF-8'); ?></strong>
-          (ID: <?php echo (int)$result['lca']['person_id']; ?>)<br>
-          Person 1 distance: <?php echo (int)$result['gen1']; ?> generations<br>
-          Person 2 distance: <?php echo (int)$result['gen2']; ?> generations
+          <?php if (!empty($result['lca_name'])): ?>
+            Lowest common ancestor: <strong><?php echo htmlspecialchars((string)$result['lca_name'], ENT_QUOTES, 'UTF-8'); ?></strong>
+            (ID: <?php echo (int)($result['lca_id'] ?? 0); ?>)
+          <?php endif; ?>
         </div>
       <?php else: ?>
         <div class="alert alert-warning">No relationship found.</div>
