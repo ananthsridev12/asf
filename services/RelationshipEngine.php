@@ -5,6 +5,7 @@ final class RelationshipEngine
 {
     private PDO $db;
     private PersonModel $persons;
+    private ?array $dictionary = null;
 
     public function __construct(PDO $db, PersonModel $persons)
     {
@@ -18,12 +19,13 @@ final class RelationshipEngine
         $otherId = (int)$other['person_id'];
 
         if ($baseId === $otherId) {
-            return $this->result('Self', 'core', 'both', 0, 0, null, 0, 0);
+            return $this->result('self', 'Self', 'core', 'both', 0, 0, null, 0, 0);
         }
 
         if ($this->hasMarriage($baseId, $otherId)) {
             $label = ((string)($other['gender'] ?? '') === 'male') ? 'Husband' : (((string)($other['gender'] ?? '') === 'female') ? 'Wife' : 'Spouse');
-            return $this->result($label, 'core', 'in_law', 1, 0, null, 0, 0);
+            $relKey = strtolower($label);
+            return $this->result($relKey, $label, 'core', 'in_law', 1, 0, null, 0, 0);
         }
 
         $blood = $this->calculateBlood($base, $other, 6);
@@ -39,11 +41,11 @@ final class RelationshipEngine
         if (!empty($siblingIds)) {
             if ($this->isMarriedToAny($otherId, $siblingIds)) {
                 $label = $this->siblingSpouseLabel($otherGender);
-                return $this->result($label, 'in_law', 'in_law', 2, 0, null, 0, 0);
+                return $this->result($this->toKey($label), $label, 'in_law', 'in_law', 2, 0, null, 0, 0);
             }
             if ($this->isChildOfAny($otherId, $siblingIds)) {
                 $label = $otherGender === 'male' ? 'Nephew' : ($otherGender === 'female' ? 'Niece' : 'Niece/Nephew');
-                return $this->result($label, 'extended', 'both', 2, 1, null, 0, 0);
+                return $this->result($this->toKey($label), $label, 'extended', 'both', 2, 1, null, 0, 0);
             }
         }
 
@@ -61,17 +63,17 @@ final class RelationshipEngine
         if (!empty($spouseSiblingIds)) {
             if ($this->isMarriedToAny($otherId, $spouseSiblingIds)) {
                 if ($baseGender === 'female' && $otherGender === 'female') {
-                    return $this->result('Co-sister', 'in_law', 'in_law', 2, 0, null, 0, 0);
+                    return $this->result('co_sister', 'Co-sister', 'in_law', 'in_law', 2, 0, null, 0, 0);
                 }
                 if ($baseGender === 'male' && $otherGender === 'male') {
-                    return $this->result('Co-brother', 'in_law', 'in_law', 2, 0, null, 0, 0);
+                    return $this->result('co_brother', 'Co-brother', 'in_law', 'in_law', 2, 0, null, 0, 0);
                 }
                 $label = $otherGender === 'male' ? 'Brother-in-law' : ($otherGender === 'female' ? 'Sister-in-law' : 'Sibling-in-law');
-                return $this->result($label, 'in_law', 'in_law', 2, 0, null, 0, 0);
+                return $this->result($this->toKey($label), $label, 'in_law', 'in_law', 2, 0, null, 0, 0);
             }
             if ($this->isChildOfAny($otherId, $spouseSiblingIds)) {
                 $label = $otherGender === 'male' ? 'Nephew-in-law' : ($otherGender === 'female' ? 'Niece-in-law' : 'Niece/Nephew-in-law');
-                return $this->result($label, 'in_law', 'in_law', 3, 1, null, 0, 0);
+                return $this->result($this->toKey($label), $label, 'in_law', 'in_law', 3, 1, null, 0, 0);
             }
         }
 
@@ -87,6 +89,7 @@ final class RelationshipEngine
             }
             $label = $this->toInLawLabel((string)$spouseBlood['label'], (string)($other['gender'] ?? 'unknown'));
             return $this->result(
+                $this->toKey($label),
                 $label,
                 'in_law',
                 'in_law',
@@ -98,7 +101,7 @@ final class RelationshipEngine
             );
         }
 
-        return $this->result('No direct relationship', 'extended', 'both', 0, 0, null, 0, 0);
+        return $this->result('no_direct_relationship', 'No direct relationship', 'extended', 'both', 0, 0, null, 0, 0);
     }
 
     private function calculateBlood(array $base, array $other, int $maxDepth): ?array
@@ -114,14 +117,14 @@ final class RelationshipEngine
             $distance = (int)$baseMap[$otherId]['distance'];
             $side = (string)$baseMap[$otherId]['side'];
             $label = $this->ancestorDescendantLabel($distance, $otherGender, true, $side);
-            return $this->result($label, 'ancestor', $side, $distance, -$distance, $otherId, $distance, 0);
+            return $this->result($this->ancestorDescendantKey($distance, $otherGender, true, $side), $label, 'ancestor', $side, $distance, -$distance, $otherId, $distance, 0);
         }
 
         if (isset($otherMap[$baseId]) && (int)$otherMap[$baseId]['distance'] > 0) {
             $distance = (int)$otherMap[$baseId]['distance'];
             $side = (string)$otherMap[$baseId]['side'];
             $label = $this->ancestorDescendantLabel($distance, $otherGender, false, $side);
-            return $this->result($label, 'descendant', $side, $distance, $distance, $baseId, 0, $distance);
+            return $this->result($this->ancestorDescendantKey($distance, $otherGender, false, $side), $label, 'descendant', $side, $distance, $distance, $baseId, 0, $distance);
         }
 
         $common = array_values(array_intersect(array_keys($baseMap), array_keys($otherMap)));
@@ -157,17 +160,17 @@ final class RelationshipEngine
 
         if ($d1 === 1 && $d2 === 1) {
             $label = $this->siblingLabel($base, $other);
-            return $this->result($label, 'core', $side, 1, 0, $bestLca, $d1, $d2);
+            return $this->result($this->toKey($label), $label, 'core', $side, 1, 0, $bestLca, $d1, $d2);
         }
 
         if ($d1 === 1 && $d2 >= 2) {
             $label = $this->nephewNieceLabel($d2, $otherGender, $side);
-            return $this->result($label, 'extended', $side, $d2 - 1, 1 - $d2, $bestLca, $d1, $d2);
+            return $this->result($this->toKey($label), $label, 'extended', $side, $d2 - 1, 1 - $d2, $bestLca, $d1, $d2);
         }
 
         if ($d2 === 1 && $d1 >= 2) {
             $label = $this->uncleAuntLabel($d1, $otherGender, $side);
-            return $this->result($label, 'extended', $side, $d1 - 1, $d1 - 1, $bestLca, $d1, $d2);
+            return $this->result($this->toKey($label), $label, 'extended', $side, $d1 - 1, $d1 - 1, $bestLca, $d1, $d2);
         }
 
         $minD = min($d1, $d2);
@@ -178,7 +181,7 @@ final class RelationshipEngine
             if ($removed > 0) {
                 $label .= ' ' . $this->removedText($removed);
             }
-            return $this->result($label, 'cousin', $side, $degree, $d1 - $d2, $bestLca, $d1, $d2);
+            return $this->result($this->cousinKey($degree, $removed), $label, 'cousin', $side, $degree, $d1 - $d2, $bestLca, $d1, $d2);
         }
 
         return null;
@@ -302,6 +305,7 @@ final class RelationshipEngine
     }
 
     private function result(
+        string $relKey,
         string $label,
         string $category,
         string $side,
@@ -311,8 +315,10 @@ final class RelationshipEngine
         int $stepsFromPerson1,
         int $stepsFromPerson2
     ): array {
+        $resolvedLabel = $this->dictionaryLabel($relKey, $label);
         return [
-            'label' => $label,
+            'rel_key' => $relKey,
+            'label' => $resolvedLabel,
             'category' => $category,
             'side' => $side,
             'degree' => $degree,
@@ -321,6 +327,64 @@ final class RelationshipEngine
             'steps_from_person1' => $stepsFromPerson1,
             'steps_from_person2' => $stepsFromPerson2,
         ];
+    }
+
+    private function toKey(string $label): string
+    {
+        $s = strtolower($label);
+        $s = str_replace(['/', '-', '  '], ['_', '_', ' '], $s);
+        $s = preg_replace('/\s+/', '_', $s);
+        return trim((string)$s, '_');
+    }
+
+    private function cousinKey(int $degree, int $removed): string
+    {
+        if ($removed === 0) {
+            return $this->toKey($this->ordinal($degree) . ' cousin');
+        }
+        return $this->toKey($this->ordinal($degree) . ' cousin ' . $this->removedText($removed));
+    }
+
+    private function ancestorDescendantKey(int $distance, string $gender, bool $ancestor, string $side): string
+    {
+        $base = $ancestor
+            ? ($gender === 'male' ? 'father' : ($gender === 'female' ? 'mother' : 'parent'))
+            : ($gender === 'male' ? 'son' : ($gender === 'female' ? 'daughter' : 'child'));
+        if ($distance === 1) {
+            return $base;
+        }
+        if ($distance === 2) {
+            $prefix = $ancestor && in_array($side, ['paternal', 'maternal'], true) ? $side . '_' : '';
+            return $prefix . 'grand' . $base;
+        }
+        if ($distance === 3) {
+            return 'great_grand' . $base;
+        }
+        return $this->ordinal($distance - 2) . '_great_grand' . $base;
+    }
+
+    private function dictionaryLabel(string $relKey, string $fallback): string
+    {
+        if ($relKey === '') {
+            return $fallback;
+        }
+        if ($this->dictionary === null) {
+            $this->dictionary = [];
+            try {
+                $stmt = $this->db->query('SELECT rel_key, label FROM relationship_dictionary');
+                $rows = $stmt->fetchAll();
+                foreach ($rows as $row) {
+                    $k = (string)($row['rel_key'] ?? '');
+                    $v = (string)($row['label'] ?? '');
+                    if ($k !== '' && $v !== '') {
+                        $this->dictionary[$k] = $v;
+                    }
+                }
+            } catch (Throwable $e) {
+                $this->dictionary = [];
+            }
+        }
+        return $this->dictionary[$relKey] ?? $fallback;
     }
 
     private function siblingLabel(array $base, array $other): string
