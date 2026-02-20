@@ -118,12 +118,12 @@ final class RelationshipEngine
         }
 
         if ($d1 === 1 && $d2 >= 2) {
-            $label = $this->uncleAuntLabel($d2, $otherGender, $side);
+            $label = $this->nephewNieceLabel($d2, $otherGender, $side);
             return $this->result($label, 'extended', $side, $d2 - 1, 1 - $d2, $bestLca, $d1, $d2);
         }
 
         if ($d2 === 1 && $d1 >= 2) {
-            $label = $this->nephewNieceLabel($d1, $otherGender, $side);
+            $label = $this->uncleAuntLabel($d1, $otherGender, $side);
             return $this->result($label, 'extended', $side, $d1 - 1, $d1 - 1, $bestLca, $d1, $d2);
         }
 
