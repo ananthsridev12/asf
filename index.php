@@ -15,6 +15,7 @@ require_once __DIR__ . '/models/BranchModel.php';
 require_once __DIR__ . '/models/PersonModel.php';
 require_once __DIR__ . '/models/UserModel.php';
 require_once __DIR__ . '/models/ActivityLogModel.php';
+require_once __DIR__ . '/services/RelationshipEngine.php';
 require_once __DIR__ . '/controllers/AuthController.php';
 require_once __DIR__ . '/controllers/AdminController.php';
 require_once __DIR__ . '/controllers/PersonController.php';

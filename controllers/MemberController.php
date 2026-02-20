@@ -9,6 +9,7 @@ final class MemberController
     private PersonModel $persons;
     private BranchModel $branches;
     private ActivityLogModel $logs;
+    private RelationshipEngine $relationshipEngine;
 
     public function __construct(PDO $db)
     {
@@ -16,6 +17,7 @@ final class MemberController
         $this->persons = new PersonModel($db);
         $this->branches = new BranchModel($db);
         $this->logs = new ActivityLogModel($db);
+        $this->relationshipEngine = new RelationshipEngine($db, $this->persons);
     }
 
     public function dashboard(): void
@@ -216,29 +218,8 @@ final class MemberController
             $base = $this->persons->getById($basePersonId);
             if ($base) {
                 foreach ($items as $item) {
-                    $label = $this->getExplicitRelationship($base, $item);
-                    if ($label === 'No direct relationship') {
-                        $p1 = array_map('intval', array_filter(explode('/', trim((string)$base['lineage_path'], '/'))));
-                        $p2 = array_map('intval', array_filter(explode('/', trim((string)$item['lineage_path'], '/'))));
-                        $len = min(count($p1), count($p2));
-                        $idx = -1;
-                        for ($i = 0; $i < $len; $i++) {
-                            if ($p1[$i] === $p2[$i]) {
-                                $idx = $i;
-                            } else {
-                                break;
-                            }
-                        }
-                        if ($idx >= 0) {
-                            $gen1 = count($p1) - $idx - 1;
-                            $gen2 = count($p2) - $idx - 1;
-                            $lineage = $this->describeLineageRelationship($gen1, $gen2, (string)($item['gender'] ?? 'unknown'));
-                            if ($lineage !== null) {
-                                $label = ucfirst($lineage);
-                            }
-                        }
-                    }
-                    $relations[(int)$item['person_id']] = $label;
+                    $meta = $this->relationshipEngine->calculate($base, $item);
+                    $relations[(int)$item['person_id']] = (string)($meta['label'] ?? 'No direct relationship');
                 }
             }
         }
@@ -869,72 +850,22 @@ final class MemberController
 
         $result = null;
         if ($person1 && $person2) {
-            // Direct spouse check from marriages table (both directions).
-            $marriageStmt = $this->db->prepare(
-                'SELECT marriage_id, status, marriage_date, divorce_date
-                 FROM marriages
-                 WHERE (person1_id = :id1 AND person2_id = :id2)
-                    OR (person1_id = :id3 AND person2_id = :id4)
-                 ORDER BY marriage_id DESC
-                 LIMIT 1'
-            );
-            $marriageStmt->execute([
-                ':id1' => $person1['person_id'],
-                ':id2' => $person2['person_id'],
-                ':id3' => $person2['person_id'],
-                ':id4' => $person1['person_id'],
-            ]);
-            $marriage = $marriageStmt->fetch();
-
-            if ($marriage) {
-                $result = [
-                    'type' => 'spouse',
-                    'marriage' => $marriage,
-                ];
-            }
-
-            if ($result !== null) {
-                include __DIR__ . '/../views/member/relationship.php';
-                return;
-            }
-
-            $explicit = $this->getExplicitRelationship($person1, $person2);
-            if ($explicit !== 'No direct relationship') {
+            $meta = $this->relationshipEngine->calculate($person1, $person2);
+            if (($meta['label'] ?? '') !== 'No direct relationship') {
+                $lcaPerson = null;
+                if (!empty($meta['lca_person_id'])) {
+                    $lcaPerson = $this->persons->getById((int)$meta['lca_person_id']);
+                }
                 $result = [
                     'type' => 'explicit',
-                    'label' => $explicit,
-                ];
-                include __DIR__ . '/../views/member/relationship.php';
-                return;
-            }
-
-            $p1 = array_map('intval', array_filter(explode('/', trim($person1['lineage_path'], '/'))));
-            $p2 = array_map('intval', array_filter(explode('/', trim($person2['lineage_path'], '/'))));
-
-            $len = min(count($p1), count($p2));
-            $lca = null;
-            $idx = 0;
-            for ($i = 0; $i < $len; $i++) {
-                if ($p1[$i] === $p2[$i]) {
-                    $lca = $p1[$i];
-                    $idx = $i;
-                } else {
-                    break;
-                }
-            }
-
-            if ($lca) {
-                $gen1 = count($p1) - $idx - 1;
-                $gen2 = count($p2) - $idx - 1;
-                $lcaPerson = $this->persons->getById($lca);
-                $lineageLabel = $this->describeLineageRelationship($gen1, $gen2, (string)($person2['gender'] ?? 'unknown'));
-
-                $result = [
-                    'type' => 'lineage',
+                    'label' => (string)$meta['label'],
+                    'category' => (string)($meta['category'] ?? ''),
+                    'side' => (string)($meta['side'] ?? ''),
+                    'degree' => (int)($meta['degree'] ?? 0),
+                    'generation_delta' => (int)($meta['generation_delta'] ?? 0),
                     'lca' => $lcaPerson,
-                    'gen1' => $gen1,
-                    'gen2' => $gen2,
-                    'label' => $lineageLabel,
+                    'gen1' => (int)($meta['steps_from_person1'] ?? 0),
+                    'gen2' => (int)($meta['steps_from_person2'] ?? 0),
                 ];
             }
         }
@@ -1286,12 +1217,11 @@ final class MemberController
 
     private function getExplicitRelationship(array $base, array $other): string
     {
+        $meta = $this->relationshipEngine->calculate($base, $other);
+        return (string)($meta['label'] ?? 'No direct relationship');
+
         $baseId = (int)$base['person_id'];
         $otherId = (int)$other['person_id'];
-
-        if ($baseId === $otherId) {
-            return 'Self';
-        }
 
         $spouseStmt = $this->db->prepare(
             'SELECT 1
@@ -1578,12 +1508,14 @@ final class MemberController
             return 'Sibling';
         }
 
+        // Other is descendant of base's sibling.
         if ($d1 === 1 && $d2 >= 2) {
-            return $this->uncleAuntLabel($d2, $otherGender);
+            return $this->nephewNieceLabel($d2, $otherGender);
         }
 
+        // Other is sibling of base's parent/grandparent line.
         if ($d2 === 1 && $d1 >= 2) {
-            return $this->nephewNieceLabel($d1, $otherGender);
+            return $this->uncleAuntLabel($d1, $otherGender);
         }
 
         $minD = min($d1, $d2);

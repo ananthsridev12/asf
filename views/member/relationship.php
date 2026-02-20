@@ -55,6 +55,18 @@ require_role('member');
       <?php elseif ($result && ($result['type'] ?? '') === 'explicit'): ?>
         <div class="alert alert-success">
           Relationship: <strong><?php echo htmlspecialchars((string)($result['label'] ?? ''), ENT_QUOTES, 'UTF-8'); ?></strong>
+          <br>
+          Category: <?php echo htmlspecialchars((string)($result['category'] ?? ''), ENT_QUOTES, 'UTF-8'); ?> |
+          Side: <?php echo htmlspecialchars((string)($result['side'] ?? ''), ENT_QUOTES, 'UTF-8'); ?> |
+          Degree: <?php echo (int)($result['degree'] ?? 0); ?> |
+          Generation Delta: <?php echo (int)($result['generation_delta'] ?? 0); ?>
+          <?php if (!empty($result['lca'])): ?>
+            <br>
+            Closest common ancestor: <strong><?php echo htmlspecialchars((string)$result['lca']['full_name'], ENT_QUOTES, 'UTF-8'); ?></strong>
+            (ID: <?php echo (int)$result['lca']['person_id']; ?>)<br>
+            Person 1 distance: <?php echo (int)($result['gen1'] ?? 0); ?> generations<br>
+            Person 2 distance: <?php echo (int)($result['gen2'] ?? 0); ?> generations
+          <?php endif; ?>
         </div>
       <?php elseif ($result && ($result['type'] ?? '') === 'lineage' && !empty($result['lca'])): ?>
         <div class="alert alert-success">
