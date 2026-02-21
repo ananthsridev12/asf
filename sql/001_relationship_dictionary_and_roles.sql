@@ -14,8 +14,8 @@ CREATE TABLE IF NOT EXISTS relationship_dictionary (
 );
 
 CREATE TABLE IF NOT EXISTS person_roles (
-  person_role_id INT AUTO_INCREMENT PRIMARY KEY,
-  person_id INT NOT NULL,
+  person_role_id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  person_id BIGINT(20) UNSIGNED NOT NULL,
   role_key VARCHAR(80) NOT NULL,
   role_label VARCHAR(120) NOT NULL,
   is_active TINYINT(1) NOT NULL DEFAULT 1,
